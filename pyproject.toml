@@ -1,0 +1,32 @@
+[project]
+name = "coo-agent"
+version = "0.5.0"
+description = "Multi-agent orchestration system"
+requires-python = ">=3.11"
+dependencies = [
+    "aiosqlite>=0.19.0",
+    "structlog>=24.1.0",
+    "pydantic>=2.5.0",
+    "click>=8.1.0",
+    "docker>=7.0.0",
+    "pyyaml>=6.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.12.0",
+    "mypy>=1.8.0"
+]
+
+[project.scripts]
+coo = "coo.cli:cli"
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["coo*"]

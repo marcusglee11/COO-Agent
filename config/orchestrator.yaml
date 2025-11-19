@@ -1,0 +1,21 @@
+orchestrator:
+  tick_interval_seconds: 1
+  max_concurrent_missions: 5
+  heartbeat_timeout_seconds: 300
+
+budgets:
+  global:
+    daily_limit_usd: 50.00
+    monthly_limit_usd: 500.00
+  
+  default_mission:
+    max_cost_usd: 5.00
+    max_loops: 20
+    safety_margin: 0.95
+  
+  budget_increase:
+    max_requests_per_mission: 3
+
+backpressure:
+  max_pending_messages: 50
+  resume_threshold: 30
