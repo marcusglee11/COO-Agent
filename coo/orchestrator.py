@@ -77,6 +77,30 @@ class Orchestrator:
     async def tick(self):
         # 1. Reclaim stale messages
         await self.store.reclaim_stale_messages()
+        
+        # Backpressure check (per mission)
+        # We iterate over active missions to check for backpressure
+        # For simplicity in this loop, we'll check backpressure when processing messages 
+        # or we can iterate missions. 
+        # Since we process by agent, let's check backpressure before claiming messages for a mission.
+        # But claim_pending_messages doesn't take a mission_id by default (it takes None).
+        # So we might pick up messages for a mission that should be paused.
+        # Ideally, we should check backpressure for all active missions.
+        
+        # For now, let's implement a simple check: if ANY mission has too many pending messages, 
+        # we pause it.
+        # We need to get active missions first.
+        # This might be expensive to do every tick if there are many missions.
+        # But for now it's fine.
+        
+        # Actually, the spec says: "If pending > 50, transition to paused_error".
+        # We can do this check when we load the mission context in process_message, 
+        # OR we can do a separate sweep.
+        # A separate sweep is safer to prevent the queue from growing if agents are fast.
+        
+        # Let's do it in process_message for the specific mission we are working on.
+        # That avoids iterating all missions every tick.
+
 
         # 2. Process pending messages for each agent
         for agent_name, agent in self.agents.items():
@@ -96,6 +120,20 @@ class Orchestrator:
         mission = await self.store.get_mission(msg["mission_id"])
         if not mission:
             log.error("mission_not_found", mission_id=msg["mission_id"])
+            return
+            
+        # Check backpressure
+        max_pending = self.config.get("backpressure", {}).get("max_pending_messages", 50)
+        pending_count = await self.store.count_pending_messages(mission["id"])
+        
+        if pending_count > max_pending:
+            log.warning(
+                "backpressure_triggered", 
+                mission_id=mission["id"], 
+                pending=pending_count, 
+                limit=max_pending
+            )
+            await self.store.update_mission_status(mission["id"], "paused_error")
             return
 
         # Get conversation history

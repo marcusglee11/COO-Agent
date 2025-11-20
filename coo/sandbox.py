@@ -117,9 +117,10 @@ class SandboxRunner:
             import functools
             try:
                 # Wait for container to finish
-                result = await loop.run_in_executor(
-                    None, functools.partial(container.wait, timeout=timeout)
-                )
+                # Fix: Use asyncio.wait_for instead of container.wait(timeout=...)
+                wait_coro = loop.run_in_executor(None, container.wait)
+                result = await asyncio.wait_for(wait_coro, timeout=timeout)
+                
                 exit_code = result["StatusCode"]
                 stdout = await loop.run_in_executor(
                     None, functools.partial(container.logs, stdout=True, stderr=False)
@@ -130,10 +131,15 @@ class SandboxRunner:
                 stdout = stdout.decode("utf-8", errors="replace")
                 stderr = stderr.decode("utf-8", errors="replace")
                 
-            except Exception as e:
-                # Timeout or other error
+            except asyncio.TimeoutError:
                 container.kill()
-                error_class = "timeout" if "Read timed out" in str(e) else "execution_error"
+                error_class = "timeout"
+                stderr = f"Execution timed out after {timeout}s"
+                exit_code = -1
+            except Exception as e:
+                # Other error
+                container.kill()
+                error_class = "execution_error"
                 stderr = str(e)
                 exit_code = -1
             

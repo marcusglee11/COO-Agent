@@ -96,20 +96,38 @@ class BudgetGuard:
                 (self.reservation, self.reservation)
             )
             await self.conn.commit()
+            
+            # CRITICAL: Close connection to release lock during LLM call
+            await self.conn.close()
+            self.conn = None
+            
             return self
             
         except Exception:
-            await self.conn.close()
-            self.conn = None
+            if self.conn:
+                await self.conn.close()
+                self.conn = None
             raise
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.conn:
-            await self.conn.close()
+        # If exception occurred during LLM call, we need to refund the reservation
+        if exc_type:
+            # Refund reservation
+            async with aiosqlite.connect(str(self.db_path)) as db:
+                await db.execute("BEGIN IMMEDIATE")
+                await db.execute(
+                    "UPDATE missions SET spent_cost_usd = spent_cost_usd - ? WHERE id = ?",
+                    (self.reservation, self.mission_id)
+                )
+                await db.execute(
+                    "UPDATE budgets_global SET daily_spent_usd = daily_spent_usd - ?, monthly_spent_usd = monthly_spent_usd - ? WHERE id = 1",
+                    (self.reservation, self.reservation)
+                )
+                await db.commit()
 
     async def commit(self, actual_cost: float, actual_tokens: int):
         # New transaction to adjust
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(str(self.db_path)) as db:
             await db.execute("BEGIN IMMEDIATE")
             
             # Subtract reservation, add actual
@@ -134,6 +152,9 @@ class BudgetGuard:
                      raise BudgetExceededError(f"Mission budget exceeded after commit: {row[0]} > {row[1]}")
             
             await db.commit()
+            
+            # Reset reservation so __aexit__ doesn't refund it if called after commit
+            self.reservation = 0.0
 
 
 class BudgetTracker:

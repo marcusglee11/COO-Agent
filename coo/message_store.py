@@ -363,3 +363,22 @@ class MessageStore:
                 rows = await cursor.fetchall()
                 # Return reversed (oldest first) for LLM context
                 return [dict(row) for row in reversed(rows)]
+
+    async def count_pending_messages(self, mission_id: str) -> int:
+        """Count pending messages for a mission"""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM messages WHERE mission_id = ? AND status = 'pending'",
+                (mission_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else 0
+    
+    async def update_mission_status(self, mission_id: str, status: str):
+        """Update mission status"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE missions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (status, mission_id),
+            )
+            await db.commit()
