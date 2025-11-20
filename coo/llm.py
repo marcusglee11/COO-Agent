@@ -24,11 +24,20 @@ class LLMResponse:
 class ModelClient:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.api_key = os.environ.get("OPENROUTER_API_KEY")
-        if not self.api_key:
-            log.warning("OPENROUTER_API_KEY not set. LLM calls will fail.")
         
-        self.base_url = "https://openrouter.ai/api/v1"
+        # Get default model config for API settings
+        models_section = config.get("models", {})
+        default_conf = models_section.get("default", {})
+        
+        # Read API key from environment using configured variable name
+        api_key_env = default_conf.get("api_key_env", "OPENROUTER_API_KEY")
+        self.api_key = os.environ.get(api_key_env)
+        if not self.api_key:
+            log.warning("%s not set. LLM calls will fail.", api_key_env)
+        
+        # Use configured base URL
+        self.base_url = default_conf.get("base_url", "https://openrouter.ai/api/v1")
+        
         # Use sync client for thread pool
         self.client = httpx.Client(
             base_url=self.base_url,
@@ -57,7 +66,10 @@ class ModelClient:
         return input_cost + output_cost
 
     def get_model_conf(self, model_name: str) -> Dict:
-        return self.config.get("models", {}).get(model_name, {})
+        """Get model configuration by name, with fallback to 'default'"""
+        models_section = self.config.get("models", {})
+        # Prefer explicit model, else fallback to "default"
+        return models_section.get(model_name) or models_section.get("default", {})
 
     async def chat(
         self, 
@@ -65,6 +77,7 @@ class ModelClient:
         mission: Dict[str, Any],
         messages: List[Dict[str, str]], 
         model_name: str,
+        temperature: Optional[float] = None,
     ) -> Dict[str, Any]:
         
         model_conf = self.get_model_conf(model_name)
@@ -77,7 +90,8 @@ class ModelClient:
             self._sync_chat,
             messages,
             model_name,
-            max_tokens_per_call
+            max_tokens_per_call,
+            temperature
         )
         
         # Enforce token limit
@@ -100,7 +114,8 @@ class ModelClient:
         self, 
         messages: List[Dict[str, str]], 
         model: str,
-        max_tokens: int
+        max_tokens: int,
+        temperature: Optional[float] = None
     ) -> LLMResponse:
         start_time = time.time()
         
@@ -117,14 +132,23 @@ class ModelClient:
             if len(last_msg.get("content", "")) > max_prompt_chars:
                 last_msg["content"] = last_msg["content"][:max_prompt_chars] + "... (truncated)"
 
+        # Resolve router_model from config (for logical model pools)
+        model_conf = self.get_model_conf(model)
+        router_model = model_conf.get("router_model", model)
+        
         payload = {
-            "model": model,
+            "model": router_model,
             "messages": messages,
             "max_tokens": max_tokens,
         }
         
+        # Add temperature if specified
+        if temperature is not None:
+            payload["temperature"] = temperature
+        
         try:
-            log.info("llm_request", model=model, message_count=len(messages))
+            log.info("llm_request", model=model, router_model=router_model, 
+                    message_count=len(messages), temperature=temperature)
             response = self.client.post("/chat/completions", json=payload)
             response.raise_for_status()
             data = response.json()

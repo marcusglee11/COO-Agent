@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
+
 @dataclass
 class Emission:
     type: str  # "message", "side_effect", "sandbox_execute"
@@ -9,13 +10,21 @@ class Emission:
 
 
 class Agent(ABC):
-    def __init__(self, name: str, model_client=None, prompt_manager=None, budget_tracker=None, model_name: str = "default"):
+    def __init__(
+        self, 
+        name: str, 
+        model_client=None, 
+        prompt_manager=None, 
+        budget_tracker=None, 
+        model_name: str = "default",
+        temperature: float = 0.5
+    ):
         self.name = name
         self.model_client = model_client
         self.prompt_manager = prompt_manager
         self.budget_tracker = budget_tracker
         self.model_name = model_name
-        self.timeout_seconds: int = 300
+        self.temperature = temperature
 
     @abstractmethod
     async def process_stream(
@@ -25,8 +34,11 @@ class Agent(ABC):
         pass
 
     async def call_llm(self, mission: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[str, Any]:
-        if not self.model_client or not self.budget_tracker:
-            raise RuntimeError("Agent not initialized with LLM/Budget components")
+        """Call LLM with budget tracking and prompt management"""
+        if not self.model_client or not self.budget_tracker or not self.prompt_manager:
+            raise RuntimeError(
+                f"Agent {self.name} not initialized with required components (LLM/Budget/Prompts)"
+            )
 
         model_conf = self.model_client.get_model_conf(self.model_name)
 
@@ -39,15 +51,16 @@ class Agent(ABC):
             # Build messages
             messages = self.prompt_manager.build_messages(self.name, mission, history)
 
-            # Call LLM
+            # Call LLM with temperature from agent config
             result = await self.model_client.chat(
                 agent_name=self.name,
                 mission=mission,
                 messages=messages,
                 model_name=self.model_name,
+                temperature=self.temperature,
             )
 
-            # Commit budget with actuals
+            # Commit budget with actual cost from ModelClient
             await guard.commit(
                 actual_cost=result["cost_usd"],
                 actual_tokens=result["usage"]["total_tokens"],

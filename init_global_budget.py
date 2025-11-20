@@ -1,13 +1,21 @@
 import asyncio
 import aiosqlite
+from pathlib import Path
 
-# IMPORTANT: your real DB path from `coo init-db`
-DB_PATH = r"C:\Users\cabra\.local\share\coo\coo.db"
+# Use standard COO database location
+DB_PATH = Path.home() / ".local" / "share" / "coo" / "coo.db"
 
 
 async def main() -> None:
-    # Connect directly to the SQLite DB
-    async with aiosqlite.connect(DB_PATH) as db:
+    """Initialize global budget in the database"""
+    if not DB_PATH.exists():
+        print(f"ERROR: Database not found at {DB_PATH}")
+        print("Please run 'python -m coo.cli init-db' first to create the database schema.")
+        return
+    
+    try:
+        # Connect directly to the SQLite DB
+        async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
             INSERT OR IGNORE INTO budgets_global (
@@ -30,7 +38,11 @@ async def main() -> None:
         )
         await db.commit()
 
-    print(f"OK: Global budget row inserted or already exists in {DB_PATH!r}.")
+        print(f"SUCCESS: Global budget row initialized in {DB_PATH}")
+    
+    except aiosqlite.OperationalError as e:
+        print(f"ERROR: Database operation failed: {e}")
+        print("The database schema may be incomplete. Please run 'python -m coo.cli init-db'")
 
 
 if __name__ == "__main__":

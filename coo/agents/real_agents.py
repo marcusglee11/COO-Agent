@@ -8,6 +8,17 @@ class RealCOO(Agent):
     async def process_stream(
         self, mission: Dict[str, Any], messages: List[Dict[str, Any]]
     ) -> AsyncGenerator[Emission, None]:
+        # 0. Handle CONTROL messages (User/System intervention)
+        if messages and messages[-1]["kind"] == MessageKind.CONTROL.value:
+            control_msg = messages[-1]
+            body = control_msg.get("body_json", {})
+            if body.get("action") == "resume":
+                yield Emission(
+                    type="side_effect",
+                    data={"state_transition": "executing"}
+                )
+                return
+
         # 1. Call LLM to get plan/task
         response = await self.call_llm(mission, messages)
         content = response["content"]

@@ -211,7 +211,7 @@ class MessageStore:
             db.row_factory = aiosqlite.Row
             
             # Build query dynamically based on mission_id presence
-            mission_clause = "AND mission_id = ?" if mission_id else ""
+            mission_clause = "AND m.mission_id = ?" if mission_id else ""
             params = [self.worker_id, to_agent]
             if mission_id:
                 params.append(mission_id)
@@ -224,12 +224,14 @@ class MessageStore:
                     locked_at = CURRENT_TIMESTAMP,
                     locked_by = ?
                 WHERE id IN (
-                    SELECT id FROM messages
-                    WHERE to_agent = ? 
+                    SELECT m.id FROM messages m
+                    JOIN missions mis ON m.mission_id = mis.id
+                    WHERE m.to_agent = ? 
                       {mission_clause}
-                      AND status = 'pending'
-                      AND (timeout_at IS NULL OR timeout_at > CURRENT_TIMESTAMP)
-                    ORDER BY priority DESC, created_at ASC
+                      AND m.status = 'pending'
+                      AND (m.timeout_at IS NULL OR m.timeout_at > CURRENT_TIMESTAMP)
+                      AND (mis.status NOT LIKE 'paused_%' OR m.kind = 'CONTROL')
+                    ORDER BY m.priority DESC, m.created_at ASC
                     LIMIT ?
                 )
                 RETURNING *
@@ -381,4 +383,53 @@ class MessageStore:
                 "UPDATE missions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (status, mission_id),
             )
+            await db.commit()
+
+    async def log_timeline_event(self, mission_id: str, event_type: str, data: Dict[str, Any]):
+        """Log a timeline event"""
+        import uuid
+        event_id = str(uuid.uuid4())
+        event_json = json.dumps(data)
+        
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO timeline_events (id, mission_id, event_type, event_json, created_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (event_id, mission_id, event_type, event_json),
+            )
+            await db.commit()
+
+    async def replay_dead_letter(self, dead_letter_id: str):
+        """Replay a message from the dead letter queue"""
+        async with aiosqlite.connect(self.db_path) as db:
+            # Get the original message ID from dead_letters
+            async with db.execute(
+                "SELECT original_message_id FROM dead_letters WHERE id = ?", 
+                (dead_letter_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if not row:
+                    raise ValueError(f"Dead letter {dead_letter_id} not found")
+                original_msg_id = row[0]
+
+            # Reset the message in messages table
+            # We reset retry_count to 0 to give it a fresh start
+            await db.execute(
+                """
+                UPDATE messages 
+                SET status = 'pending', 
+                    retry_count = 0, 
+                    error_type = NULL, 
+                    error_detail = NULL,
+                    locked_at = NULL,
+                    locked_by = NULL
+                WHERE id = ?
+                """,
+                (original_msg_id,)
+            )
+            
+            # Remove from dead_letters
+            await db.execute("DELETE FROM dead_letters WHERE id = ?", (dead_letter_id,))
             await db.commit()

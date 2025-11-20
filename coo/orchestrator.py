@@ -24,7 +24,7 @@ class Orchestrator:
         self.config = config
         
         # Initialize components
-        self.model_client = ModelClient(config.get("models", {}))
+        self.model_client = ModelClient(config)
         self.prompt_manager = PromptManager(Path("prompts"))
         self.budget_tracker = BudgetTracker(store.db_path, config.get("budgets", {}))
         
@@ -32,27 +32,31 @@ class Orchestrator:
         self.sandbox = SandboxRunner(store.db_path, config.get("sandbox", {}))
         
         # Initialize Agents
+        agents_cfg = config.get("agents", {})
         self.agents: Dict[str, Agent] = {
             "COO": RealCOO(
                 "COO",
                 self.model_client,
                 self.prompt_manager,
                 self.budget_tracker,
-                model_name="deepseek/deepseek-chat",
+                model_name=agents_cfg.get("COO", {}).get("model", "default"),
+                temperature=agents_cfg.get("COO", {}).get("temperature", 0.5),
             ),
             "Engineer": RealEngineer(
                 "Engineer",
                 self.model_client,
                 self.prompt_manager,
                 self.budget_tracker,
-                model_name="deepseek/deepseek-chat",
+                model_name=agents_cfg.get("Engineer", {}).get("model", "default"),
+                temperature=agents_cfg.get("Engineer", {}).get("temperature", 0.5),
             ),
             "QA": RealQA(
                 "QA",
                 self.model_client,
                 self.prompt_manager,
                 self.budget_tracker,
-                model_name="deepseek/deepseek-chat",
+                model_name=agents_cfg.get("QA", {}).get("model", "default"),
+                temperature=agents_cfg.get("QA", {}).get("temperature", 0.5),
             ),
         }
 
@@ -134,6 +138,11 @@ class Orchestrator:
                 limit=max_pending
             )
             await self.store.update_mission_status(mission["id"], "paused_error")
+            await self.store.log_timeline_event(
+                mission["id"], 
+                "backpressure_triggered", 
+                {"pending": pending_count, "limit": max_pending}
+            )
             return
 
         # Get conversation history
@@ -166,6 +175,11 @@ class Orchestrator:
                         await self.store.update_mission_status(
                             mission["id"], emission.data["state_transition"]
                         )
+                        await self.store.log_timeline_event(
+                            mission["id"], 
+                            "mission_status_changed", 
+                            {"status": emission.data["state_transition"]}
+                        )
                 
                 elif emission.type == "sandbox_execute":
                     data = emission.data
@@ -177,6 +191,16 @@ class Orchestrator:
                         entrypoint=data["entrypoint"],
                         dedupe_id=data["dedupe_id"],
                         timeout=data.get("timeout", 300),
+                    )
+                    
+                    await self.store.log_timeline_event(
+                        mission["id"], 
+                        "sandbox_execution", 
+                        {
+                            "artifact_id": data["artifact_id"],
+                            "exit_code": result.exit_code,
+                            "cached": result.cached
+                        }
                     )
                     
                     to_agent = data.get("reply_to") or ("QA" if result.exit_code == 0 else "Engineer")
@@ -205,6 +229,11 @@ class Orchestrator:
         except BudgetExceededError:
             log.warning("mission_budget_exceeded", mission_id=mission["id"])
             await self.store.update_mission_status(mission["id"], "paused_budget")
+            await self.store.log_timeline_event(
+                mission["id"], 
+                "budget_exceeded", 
+                {"reason": "mission_budget_exceeded"}
+            )
 
         except Exception as e:
             log.error("agent_processing_error", error=str(e), agent=agent.name)

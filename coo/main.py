@@ -7,7 +7,16 @@ import yaml
 from coo.message_store import MessageStore
 from coo.orchestrator import Orchestrator
 
-structlog.configure(processors=[structlog.processors.JSONRenderer()])
+from coo.logging_utils import scrub_secrets
+
+structlog.configure(
+    processors=[
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.add_log_level,
+        scrub_secrets,
+        structlog.processors.JSONRenderer()
+    ]
+)
 log = structlog.get_logger()
 
 

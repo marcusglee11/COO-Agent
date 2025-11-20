@@ -1,0 +1,66 @@
+# Tasks
+
+- [x] Phase 0: Core Infrastructure <!-- id: 0 -->
+    - [x] SQLite schema + migrations <!-- id: 1 -->
+    - [x] MessageStore async methods <!-- id: 2 -->
+    - [x] Models (Pydantic schemas) <!-- id: 3 -->
+    - [x] Config file skeleton <!-- id: 4 -->
+    - [x] CLI skeleton <!-- id: 5 -->
+    - [x] First test: `test_message_store.py` <!-- id: 6 -->
+- [x] Phase 1: Orchestrator + Dummy Agents <!-- id: 7 -->
+    - [x] `orchestrator.py` with asyncio main loop <!-- id: 8 -->
+    - [x] `Agent` base class + `process_stream` generator <!-- id: 9 -->
+    - [x] `DummyCOO`, `DummyEngineer`, `DummyQA` <!-- id: 10 -->
+    - [x] `BudgetTracker` skeleton <!-- id: 11 -->
+    - [x] End-to-end test: mission flow with no LLMs <!-- id: 12 -->
+    - [x] Stale message reclaim implementation <!-- id: 13 -->
+- [x] Pre-Phase 2 Fixes <!-- id: 42 -->
+    - [x] Fix logging import in `message_store.py` <!-- id: 43 -->
+    - [x] Replace deprecated `datetime.utcnow()` <!-- id: 44 -->
+    - [x] Update `sandbox.yaml` for cross-platform temp dir <!-- id: 45 -->
+    - [x] Update `models.yaml` to OpenRouter provider <!-- id: 46 -->
+- [x] Phase 2: Sandbox Integration <!-- id: 14 -->
+    - [x] Build `coo-sandbox:latest` Dockerfile (non-root, no-pip) <!-- id: 15 -->
+    - [x] `SandboxRunner` implementation <!-- id: 16 -->
+        - [x] `run_artifact` with idempotency & materialization <!-- id: 16a -->
+        - [x] `recover_crashed_runs` <!-- id: 16b -->
+        - [x] Security flags & cleanup <!-- id: 16c -->
+    - [x] Orchestrator integration <!-- id: 17 -->
+        - [x] Handle `SANDBOX_EXECUTE` emissions <!-- id: 17a -->
+        - [x] Inject `RESULT` message <!-- id: 17b -->
+        - [x] Startup crash recovery call <!-- id: 17c -->
+    - [x] Update `DummyEngineer` to emit `sandbox_execute` <!-- id: 47 -->
+    - [x] Test: `test_sandbox.py` (Unit + Docker) <!-- id: 48 -->
+    - [x] Test: `test_orchestrator_sandbox.py` (E2E) <!-- id: 21 -->
+- [x] Phase 3: Real LLM Agents + Budget <!-- id: 22 -->
+    - [x] `ModelClient` for DeepSeek + GLM <!-- id: 23 -->
+    - [x] Central token caps enforcement <!-- id: 24 -->
+    - [x] COO/Engineer/QA prompts via `PromptManager` <!-- id: 25 -->
+    - [x] Prompt file structure <!-- id: 26 -->
+    - [x] Cost calculation from API responses <!-- id: 27 -->
+    - [x] Hard budget enforcement + rollback on exceed <!-- id: 28 -->
+    - [x] Global daily/monthly budget tracking <!-- id: 29 -->
+    - [x] Test: budget exceed → rollback verified <!-- id: 30 -->
+    - [x] Wire Real Agents into Orchestrator <!-- id: 49 -->
+    - [x] Test: `test_orchestrator.py` with mocked Real Agents <!-- id: 50 -->
+- [x] Phase 3.5: Hardening & Fixes <!-- id: 51 -->
+    - [x] Fix `BudgetGuard` worst-case cost (Input + Output) <!-- id: 52 -->
+    - [x] Secure Artifact Creation (Filename validation) <!-- id: 53 -->
+    - [x] Enforce JSON output for QA Agent <!-- id: 54 -->
+    - [x] Implement sorted history retrieval <!-- id: 55 -->
+    - [x] Proactive prompt truncation in `ModelClient` <!-- id: 56 -->
+- [x] Phase 3.6: Critical Remediation (Code Review v1.0) <!-- id: 57 -->
+    - [x] Fix Sandbox Execution (`asyncio.wait_for`) <!-- id: 58 -->
+    - [x] Implement Backpressure (`count_pending_messages`) <!-- id: 59 -->
+    - [x] Optimize Budget Locking (Split Reserve/Settle) <!-- id: 60 -->
+- [x] Phase 4: Observability + Hardening <!-- id: 31 -->
+    - [x] `structlog` integration with secret scrubbing <!-- id: 32 -->
+    - [x] Timeline events for all major actions <!-- id: 33 -->
+    - [x] CLI commands: `coo mission`, `coo logs`, `coo dlq replay` <!-- id: 34 -->
+    - [x] Approval flow (CEO gate) + CONTROL messages <!-- id: 35 -->
+    - [x] Backpressure hard pause implementation <!-- id: 36 -->
+    - [x] Sandbox crash recovery <!-- id: 37 -->
+    - [x] `scrub_secrets` unit test <!-- id: 38 -->
+    - [x] Critical shutdown logging <!-- id: 39 -->
+    - [x] Integration tests <!-- id: 40 -->
+    - [ ] README + operations guide <!-- id: 41 -->

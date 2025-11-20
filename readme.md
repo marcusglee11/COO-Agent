@@ -1,156 +1,300 @@
-COO: The Deterministic Agent Runtime
+# COO Agent
 
-Version: 0.6-FINAL (Pre-Implementation) Status: Active Development
+**COO (Chief Operating Officer) Agent** is a multi-agent autonomous system built with SQLite-based message orchestration, secure sandboxed code execution, and fine-grained budget control.
 
-COO is a self-directed multi-agent system designed for deterministic execution, hard budget enforcement, and total sandbox isolation. Unlike event-driven or purely autonomous frameworks, COO uses a polling-based architecture backed by SQLite as the single source of truth.
+## Architecture
 
-You play the CEO. You provide natural-language missions. COOAgent plans. EngineerAgent codes. QAAgent reviews.
+The system implements a **COO → Engineer → QA** workflow:
+- **COO**: Plans tasks and coordinates work
+- **Engineer**: Writes Python code based on COO's specifications
+- **QA**: Reviews and either approves or rejects the Engineer's work
 
-🏗 Architecture
+All agents communicate via a SQLite message bus with idempotent message processing, automatic retries, and dead-letter queuing.
 
-The system runs as a single Python process (coo orchestrator) communicating with agents via a local SQLite message bus. Code execution is delegated to ephemeral, network-isolated Docker containers.
-Code snippet
+## Features
 
-graph TD
-    CEO[CEO / CLI Chat] <--> DB[(SQLite Message Bus)]
-    Orchestrator[Orchestrator Daemon] <--> DB
-    Orchestrator -- "Sync HTTP / ThreadPool" --> LLM[LLM APIs]
-    Orchestrator -- "SANDBOX_EXECUTE" --> Docker[Docker Sandbox]
-    Docker -- "Artifacts" --> DB
+- **Multi-Agent Orchestration**: Async message-based coordination between specialized agents
+- **Secure Sandbox**: Docker-based isolated code execution with no network access
+- **Budget Control**: Per-mission and global budget tracking with hard limits
+- **Observability**: Structured logging with secret scrubbing, timeline events for debugging
+- **CLI Tools**: Inspect missions, view logs, replay failed messages, resume paused missions
+- **Crash Recovery**: Automatic recovery of sandbox runs and stale messages
+- **Backpressure**: Intelligent flow control to prevent system overload
 
-Key Design Decisions
+## Quick Start
 
-    SQLite as Message Bus: No RabbitMQ or Redis. coo.db (WAL mode) handles all state, queues, and locking.
+### Prerequisites
+- Python 3.12+
+- Docker (for sandbox execution)
+- OpenRouter API key
 
-    Hard Budget Enforcement: Deterministic pre-call checks and post-call rollbacks. If an agent overspends, the transaction is reverted.
+### Installation
 
-    Network-None Sandbox: Code runs in coo-sandbox:latest with --network none. No runtime pip install allowed.
-
-    Streaming UX: The CLI polls the DB for STREAM messages to provide a live console experience without WebSockets.
-
-🚀 Getting Started
-
-Prerequisites
-
-    Python 3.11+
-
-    Docker Engine (User must have permission to run containers without sudo)
-
-    API Keys for DeepSeek (primary) and/or GLM-4 (fallback)
-
-1. Installation
-
-Clone the repository and set up the environment:
-Bash
-
-git clone https://github.com/yourusername/coo-agent.git
+```bash
+# Clone the repository
 cd coo-agent
-python -m venv .venv
-source .venv/bin/activate
+
+# Install dependencies
 pip install -r requirements.txt
 
-2. Build the Sandbox Image
+# Set up environment
+export OPENROUTER_API_KEY="your-api-key-here"
 
-Critical: The system does not allow agents to install packages at runtime. You must build the "fat" image containing all allowed dependencies (numpy, pandas, pytest, etc.) beforehand.
-Bash
+# Build sandbox Docker image
+docker build -f docker/Dockerfile.sandbox -t coo-sandbox:latest .
 
-docker build -t coo-sandbox:latest -f docker/Dockerfile.sandbox .
+# Initialize database
+python -m coo.cli init-db
+```
 
-3. Configuration
+### Running the Agent
 
-Copy the configuration templates:
-Bash
+```bash
+# Start the orchestrator
+python -m coo.main
+```
 
-cp config/models.yaml.example config/models.yaml
-cp config/orchestrator.yaml.example config/orchestrator.yaml
+### Creating a Mission
 
-Edit config/models.yaml to add your API keys or reference environment variables (e.g., DEEPSEEK_API_KEY).
+```python
+import asyncio
+from pathlib import Path
+from coo.message_store import MessageStore
+from coo.models import MessageKind
 
-4. Initialize Database
+async def create_mission():
+    db_path = Path.home() / ".local" / "share" / "coo" / "coo.db"
+    store = MessageStore(db_path)
+    
+    # Create mission
+    mission = {
+        "id": "mission-001",
+        "description": "Create a hello world script",
+        "max_cost_usd": 0.10,
+        "max_loops": 10
+    }
+    await store.create_mission(mission)
+    
+    # Send initial task
+    await store.deliver_message({
+        "id": "msg-001",
+        "mission_id": "mission-001",
+        "from_agent": "USER",
+        "to_agent": "COO",
+        "kind": MessageKind.TASK.value,
+        "body_json": {"content": "Write a Python script that prints 'Hello, World!'"}
+    })
 
-Create the SQLite database and apply the schema:
-Bash
+asyncio.run(create_mission())
+```
 
-coo init-db
+## CLI Commands
 
-Database location: ~/.local/share/coo/coo.db
+```bash
+# View mission status
+python -m coo.cli mission <mission-id>
 
-💻 Usage
+# View timeline events for a mission
+python -m coo.cli logs <mission-id>
 
-The system requires two terminal windows: one for the background orchestrator and one for your interaction.
+# Replay a dead-letter message
+python -m coo.cli dlq-replay <dead-letter-id>
 
-Terminal 1: The Orchestrator
+# Resume a paused mission
+python -m coo.cli resume <mission-id>
 
-Starts the main loop, handles message routing, and manages the thread pool for LLM calls.
-Bash
+# Initialize/reset database
+python -m coo.cli init-db
+```
 
-coo orchestrator
+## Configuration
 
-Terminal 2: The Interface
+Configuration files are located in `config/`:
 
-Use the CLI to send missions and view status.
+### `config/models.yaml`
+```yaml
+models:
+  default:
+    provider: "openrouter"
+    router_model: "deepseek/deepseek-chat"
+    max_tokens_per_call: 8000
+    pricing:
+      input_per_1k: 0.00014
+      output_per_1k: 0.00028
 
-Start a new mission:
-Bash
+agents:
+  COO:
+    model: "default"
+    temperature: 0.6
+  Engineer:
+    model: "default"
+    temperature: 0.4
+  QA:
+    model: "default"
+    temperature: 0.3
+```
 
-coo chat
-# > CEO: "Create a Python script to calculate Fibonacci sequence and unit test it."
+### `config/orchestrator.yaml`
+```yaml
+orchestrator:
+  tick_interval_seconds: 1.0
 
-Monitor progress:
-Bash
+budgets:
+  global_daily_usd: 10.0
+  global_monthly_usd: 100.0
 
-coo status                  # List all active missions and budget spent
-coo mission <id> --follow   # Stream logs and agent conversation
-coo logs --mission <id>     # View structured logs
+backpressure:
+  max_pending_messages: 50
+  resume_threshold: 30
+```
 
-Budget & Control:
-Bash
+### `config/sandbox.yaml`
+```yaml
+temp_dir: "coo-workspace"
+```
 
-coo metrics --daily         # View daily spend vs limit
-coo dlq list                # Inspect Dead Letter Queue
+## Database Schema
 
-🛡 Security & Limits
+The system uses SQLite with the following tables:
+- **missions**: Mission metadata, budget, status
+- **messages**: Message queue with locking and retries
+- **artifacts**: Code files and outputs (base64 encoded)
+- **sandbox_runs**: Execution history with idempotency
+- **dead_letters**: Failed messages for manual replay
+- **timeline_events**: Structured event log for debugging
+- **budgets**: Global daily/monthly spend tracking
 
-The Sandbox
+## Security
 
-    Network: none (No internet access inside container).
+- **Secret Scrubbing**: Automatic redaction of API keys, passwords, and tokens from logs
+- **Sandbox Isolation**: No network, limited CPU/memory, non-root user
+- **Path Validation**: Filename sanitization to prevent directory traversal
+- **Token Limits**: Enforced per-call token caps to prevent abuse
+- **Budget Hard Limits**: Transactions rolled back if budget exceeded
 
-    User: 1000:1000 (Non-root).
+## Development
 
-    Privileges: --security-opt=no-new-privileges.
+### Running Tests
 
-    Filesystem: Ephemeral bind-mount workspace; destroyed after execution.
+```bash
+# Run all tests
+pytest
 
-Budget Governance
+# Run unit tests only
+pytest tests/unit/
 
-    Per-Agent Caps: Hard token limits per call (e.g., Engineer: 8k tokens).
+# Run integration tests
+pytest tests/integration/
 
-    Global Limits: Daily and Monthly hard caps (defined in orchestrator.yaml).
+# Run with coverage
+pytest --cov=coo --cov-report=html
+```
 
-    Backpressure: Missions with >50 pending messages are auto-paused.
+### Project Structure
 
-📂 Project Structure
-
+```
 coo-agent/
 ├── coo/
-│   ├── orchestrator.py    # Main event loop & thread pool
-│   ├── message_store.py   # SQLite async wrapper
-│   ├── budget.py          # Transactional budget guard
-│   ├── sandbox.py         # Docker wrapper
-│   └── agents/            # Base agent & implementations
-├── config/                # YAML configuration
-├── docker/                # Sandbox Dockerfile
-├── prompts/               # System prompts (Markdown)
-└── tests/                 # pytest suite
+│   ├── main.py              # Entry point
+│   ├── orchestrator.py      # Main orchestration loop
+│   ├── message_store.py     # SQLite message bus
+│   ├── sandbox.py           # Docker sandbox runner
+│   ├── budget.py            # Budget tracking and guards
+│   ├── llm.py               # LLM API client
+│   ├── prompts.py           # Prompt loading
+│   ├── logging_utils.py     # Secret scrubbing
+│   ├── cli.py               # CLI commands
+│   ├── models.py            # Pydantic models
+│   └── agents/
+│       ├── base.py          # Agent base class
+│       ├── real_agents.py   # COO, Engineer, QA
+│       └── dummy_agents.py  # Test agents
+├── config/                  # YAML configuration
+├── prompts/                 # Agent system prompts
+├── tests/                   # Unit and integration tests
+└── docker/                  # Sandbox Dockerfile
+```
 
-🤝 Contributing
+## Monitoring and Debugging
 
-    Strict Types: All code must be fully typed (mypy strict mode).
+### Timeline Events
+All major system events are logged to the `timeline_events` table:
+```bash
+python -m coo.cli logs <mission-id>
+```
 
-    No Async HTTP: We use ThreadPoolExecutor for LLM calls to keep the core loop simple.
+### Structured Logs
+The system outputs JSON logs with automatic secret scrubbing:
+```python
+import structlog
+log = structlog.get_logger()
+log.info("event_name", key="value", mission_id="123")
+```
 
-    Migrations: Database schema changes must be reflected in message_store.py (v1.0 has no migration tool, just schema recreation).
+### Mission Status
+Check mission progress:
+```bash
+python -m coo.cli mission <mission-id>
+```
 
-📜 License
+## Operations Guide
 
-[License Name] - See LICENSE file for details.
+### Pausing a Mission
+Missions can be paused automatically (budget exceeded, errors) or manually:
+```python
+await store.update_mission_status(mission_id, "paused_manual")
+```
+
+### Resuming a Mission
+Send a CONTROL message:
+```bash
+python -m coo.cli resume <mission-id>
+```
+
+### Dead Letter Queue
+Failed messages go to the DLQ after max retries. Replay them:
+```bash
+python -m coo.cli dlq-replay <dead-letter-id>
+```
+
+### Budget Management
+- Check current spend in database: `SELECT * FROM budgets`
+- Reset monthly budget: Delete row for current month
+- Adjust limits: Edit `config/orchestrator.yaml`
+
+### Crash Recovery
+The orchestrator automatically recovers:
+- Stale messages (reclaimed after timeout)
+- Crashed sandbox runs (marked failed after 10 minutes)
+
+On restart, call `await self.sandbox.recover_crashed_runs()`.
+
+## Troubleshooting
+
+### LLM API Errors
+- Check `OPENROUTER_API_KEY` is set
+- Verify API key is valid
+- Check rate limits in logs
+
+### Sandbox Failures
+- Ensure Docker is running: `docker ps`
+- Rebuild sandbox image: `docker build -f docker/Dockerfile.sandbox -t coo-sandbox:latest .`
+- Check logs for timeout/OOM errors
+
+### Budget Exceeded
+- Increase `max_cost_usd` for mission
+- Increase global budget in `config/orchestrator.yaml`
+- Check pricing in `config/models.yaml` matches actual costs
+
+### Mission Stuck
+- Check message status: `SELECT * FROM messages WHERE mission_id = ?`
+- Look for deadlocks in logs
+- Resume paused mission: `python -m coo.cli resume <mission-id>`
+
+## License
+
+[Your License Here]
+
+## Contributing
+
+[Your Contributing Guidelines Here]

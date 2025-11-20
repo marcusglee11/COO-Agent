@@ -23,9 +23,10 @@ async def seed():
     await store.deliver_message({
         "id": msg_id,
         "mission_id": mission_id,
-        "from_agent": "User",
+        "from_agent": "USER",
         "to_agent": "COO",
         "kind": MessageKind.TASK.value,
+        "priority": 5,
         "body_json": {"task": "Please create a python script that prints 'Hello World'"}
     })
 

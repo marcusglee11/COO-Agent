@@ -4,22 +4,24 @@ models:
     provider: "openrouter"
     base_url: "https://openrouter.ai/api/v1"
     api_key_env: "OPENROUTER_API_KEY"
+    router_model: "deepseek/deepseek-chat"  # Actual OpenRouter model string
+    max_tokens_per_call: 8000
     pricing:
       input_per_1k: 0.00014
       output_per_1k: 0.00028
 
 agents:
+  # Agent-specific settings
+  # - model: logical model pool name (e.g., "default")
+  # - temperature: passed to LLM API (0.0 = deterministic, 1.0 = creative)
   COO:
-    model: "deepseek/deepseek-chat"
-    max_tokens_per_call: 6000
+    model: "default"  # Logical model pool
     temperature: 0.6
 
   Engineer:
-    model: "deepseek/deepseek-chat"
-    max_tokens_per_call: 8000
-    temperature: 0.3
+    model: "default"
+    temperature: 0.4
 
   QA:
-    model: "deepseek/deepseek-chat"
-    max_tokens_per_call: 4000
-    temperature: 0.2
+    model: "default"
+    temperature: 0.3
