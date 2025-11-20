@@ -1,16 +1,17 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y gcc git && rm -rf /var/lib/apt/lists/*
+# Create non-root sandbox user
+RUN useradd -ms /bin/bash sandbox
+USER sandbox
 
-RUN pip install --no-cache-dir \
-    pytest==7.4.3 \
-    requests==2.31.0 \
-    numpy==1.26.2 \
-    pandas==2.1.4 \
-    pydantic==2.5.3 \
-    black==23.12.1 \
-    flake8==7.0.0
+# Install deps
+RUN pip install --no-cache-dir numpy pandas requests pytest ipython
 
-RUN useradd -m -u 1000 -s /bin/bash sandbox
-USER 1000:1000
+# Disable pip inside container
+USER root
+RUN mv /usr/local/bin/pip /usr/local/bin/pip.disabled
+USER sandbox
+
 WORKDIR /workspace
+
+CMD ["python3"]

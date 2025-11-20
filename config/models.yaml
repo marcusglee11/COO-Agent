@@ -1,27 +1,25 @@
 version: 1
-
 models:
-  openrouter:
+  default:
     provider: "openrouter"
     base_url: "https://openrouter.ai/api/v1"
     api_key_env: "OPENROUTER_API_KEY"
-    max_tokens: 8192
     pricing:
-      input_per_1k: 0.00014   # DeepSeek-V3 example
+      input_per_1k: 0.00014
       output_per_1k: 0.00028
 
 agents:
   COO:
-    model: "openrouter"
+    model: "deepseek/deepseek-chat"
     max_tokens_per_call: 6000
-    temperature: 0.7
-    
+    temperature: 0.6
+
   Engineer:
-    model: "openrouter"
+    model: "deepseek/deepseek-chat"
     max_tokens_per_call: 8000
     temperature: 0.3
-    
+
   QA:
-    model: "openrouter"
+    model: "deepseek/deepseek-chat"
     max_tokens_per_call: 4000
     temperature: 0.2
