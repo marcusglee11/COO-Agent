@@ -433,3 +433,38 @@ class MessageStore:
             # Remove from dead_letters
             await db.execute("DELETE FROM dead_letters WHERE id = ?", (dead_letter_id,))
             await db.commit()
+    async def save_artifact(
+        self,
+        mission_id: str,
+        artifact_id: str,
+        filename: str,
+        content_b64: str,
+        mime_type: str,
+        created_by: str,
+    ):
+        """Save an artifact to the database"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO artifacts (
+                    id,
+                    mission_id,
+                    filename,
+                    mime_type,
+                    content_b64,
+                    created_at,
+                    created_by
+                ) VALUES (
+                    ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?
+                )
+                """,
+                (
+                    artifact_id,
+                    mission_id,
+                    filename,
+                    mime_type,
+                    content_b64,
+                    created_by,
+                ),
+            )
+            await db.commit()

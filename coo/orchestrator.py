@@ -1,13 +1,11 @@
 import asyncio
-import json
 import uuid
-from typing import Dict, List, Any
+import base64
+from typing import Dict, List, Optional
 from pathlib import Path
-
 import structlog
 
 from coo.agents.base import Agent
-from coo.agents.dummy_agents import DummyCOO, DummyEngineer, DummyQA
 from coo.agents.real_agents import RealCOO, RealEngineer, RealQA
 from coo.budget import BudgetTracker, BudgetExceededError
 from coo.message_store import MessageStore
@@ -170,15 +168,40 @@ class Orchestrator:
                     )
 
                 elif emission.type == "side_effect":
-                    log.info("side_effect", data=emission.data)
-                    if "state_transition" in emission.data:
+                    data = emission.data
+                    log.info("side_effect", data=data)
+
+                    # 1. Handle Engineer artifact persistence
+                    if data.get("action") == "save_artifact":
+                        artifact_id = data["artifact_id"]
+                        filename = data["filename"]
+                        raw_content = data["content"]
+                        content_b64 = base64.b64encode(raw_content.encode("utf-8")).decode("ascii")
+
+                        await self.store.save_artifact(
+                            mission_id=mission["id"],
+                            artifact_id=artifact_id,
+                            filename=filename,
+                            content_b64=content_b64,
+                            mime_type="text/x-python",
+                            created_by=agent.name,
+                        )
+
+                        await self.store.log_timeline_event(
+                            mission["id"],
+                            "artifact_saved",
+                            {"artifact_id": artifact_id, "filename": filename},
+                        )
+
+                    # 2. Handle mission state transitions (existing behaviour)
+                    if "state_transition" in data:
                         await self.store.update_mission_status(
-                            mission["id"], emission.data["state_transition"]
+                            mission["id"], data["state_transition"]
                         )
                         await self.store.log_timeline_event(
                             mission["id"], 
                             "mission_status_changed", 
-                            {"status": emission.data["state_transition"]}
+                            {"status": data["state_transition"]}
                         )
                 
                 elif emission.type == "sandbox_execute":
