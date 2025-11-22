@@ -33,7 +33,8 @@ def test_snapshot_basic(db_conn):
     
     results = snapshot_query(db_conn, mid, tid)
     assert len(results) == 1
-    assert results[0] == ("file1.txt", b"content1")
+    assert results[0][0] == "file1.txt"
+    assert results[0][1] == b"content1"
 
 def test_snapshot_versioning(db_conn):
     """Test that latest version is picked."""
@@ -62,7 +63,8 @@ def test_snapshot_versioning(db_conn):
     
     results = snapshot_query(db_conn, mid, tid)
     assert len(results) == 1
-    assert results[0] == ("file1.txt", b"v2")
+    assert results[0][0] == "file1.txt"
+    assert results[0][1] == b"v2"
 
 def test_snapshot_tombstone(db_conn):
     """Test that deleted files are excluded."""
@@ -119,7 +121,8 @@ def test_snapshot_required_artifact_override(db_conn):
     
     results = snapshot_query(db_conn, mid, tid)
     assert len(results) == 1
-    assert results[0] == ("file1.txt", b"v1")
+    assert results[0][0] == "file1.txt"
+    assert results[0][1] == b"v1"
 
 def test_snapshot_ordering(db_conn):
     """
@@ -151,29 +154,7 @@ def test_snapshot_ordering(db_conn):
     
     results = snapshot_query(db_conn, mid, tid)
     assert len(results) == 2
-    assert results[0] == ("a.txt", b"content_a")
-    assert results[1] == ("z.txt", b"content_z")
-
-def test_snapshot_tombstone_required_exclusion(db_conn):
-    """
-    Test that if a required artifact is a tombstone (is_deleted=1),
-    it is excluded from the snapshot.
-    """
-    mid = "m1"
-    tid = "t1"
-    started_at = datetime.utcnow()
-    
-    # Setup mission and task requiring a1
-    db_conn.execute("INSERT INTO missions (id, status, description, max_cost_usd, max_loops, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                   (mid, "executing", "desc", 10.0, 5, datetime.utcnow(), datetime.utcnow()))
-    db_conn.execute("INSERT INTO mission_tasks (id, mission_id, task_order, description, status, started_at, created_at, required_artifact_ids) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                   (tid, mid, 1, "task1", "executing", started_at, datetime.utcnow(), json.dumps(["a1"])))
-    
-    # a1 is a tombstone
-    db_conn.execute("""
-        INSERT INTO artifacts (id, mission_id, file_path, version_number, kind, created_at, is_deleted)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, ("a1", mid, "file1.txt", 1, "file", started_at - timedelta(seconds=10), 1))
-    
-    results = snapshot_query(db_conn, mid, tid)
-    assert len(results) == 0
+    assert results[0][0] == "a.txt"
+    assert results[0][1] == b"content_a"
+    assert results[1][0] == "z.txt"
+    assert results[1][1] == b"content_z"

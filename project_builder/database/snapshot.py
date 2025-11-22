@@ -1,15 +1,15 @@
 import sqlite3
 
-def snapshot_query(conn: sqlite3.Connection, mission_id: str, task_id: str) -> list[tuple[str, bytes]]:
+def snapshot_query(conn: sqlite3.Connection, mission_id: str, task_id: str) -> list[tuple[str, bytes, str]]:
     """
-    Returns a list of (file_path, content_bytes) representing the snapshot
+    Returns a list of (file_path, content_bytes, created_at_iso) representing the snapshot
     for mission_id + task_id per spec v0.9.
     
     Uses the normative SQL query with ROW_NUMBER() CTE and required_artifact_ids overrides.
     """
     query = """
     WITH snapshot_artifacts AS (
-      SELECT a.file_path, a.content, a.is_deleted
+      SELECT a.file_path, a.content, a.is_deleted, a.created_at
       FROM artifacts a
       JOIN mission_tasks t ON t.mission_id = a.mission_id
       WHERE t.id = :task_id
@@ -25,7 +25,7 @@ def snapshot_query(conn: sqlite3.Connection, mission_id: str, task_id: str) -> l
         )
     ),
     required_artifacts AS (
-      SELECT a.file_path, a.content
+      SELECT a.file_path, a.content, a.created_at
       FROM artifacts a
       WHERE a.mission_id = :mission_id
         AND a.id IN (
@@ -42,10 +42,10 @@ def snapshot_query(conn: sqlite3.Connection, mission_id: str, task_id: str) -> l
         )
         AND a.is_deleted = 0
     )
-    SELECT file_path, content
+    SELECT file_path, content, created_at
     FROM required_artifacts
     UNION
-    SELECT file_path, content
+    SELECT file_path, content, created_at
     FROM snapshot_artifacts
     WHERE is_deleted = 0
       AND file_path NOT IN (SELECT file_path FROM required_artifacts)

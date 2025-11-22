@@ -1,4 +1,6 @@
 import json
+import sqlite3
+from project_builder.config.settings import PLANNER_BUDGET_FRACTION
 
 def validate_required_artifact_ids(required_artifact_ids: list[str] | None) -> None:
     """
@@ -18,11 +20,18 @@ def validate_required_artifact_ids(required_artifact_ids: list[str] | None) -> N
         if not isinstance(item, str):
             raise ValueError("required_artifact_ids items must be strings")
 
-def validate_plan_budget(total_task_budget: float, mission_max_budget: float) -> None:
+def validate_plan_budget(conn: sqlite3.Connection, mission_id: str, estimated_cost_usd: float) -> None:
     """
     Validates that the sum of all task budgets does not exceed 80% of the Mission Max Budget
     per Packet §5.6.
     """
-    limit = mission_max_budget * 0.80
-    if total_task_budget > limit:
-        raise ValueError(f"Plan budget {total_task_budget} exceeds 80% of mission max {mission_max_budget} (Limit: {limit})")
+    cur = conn.execute("SELECT max_cost_usd FROM missions WHERE id = ?", (mission_id,))
+    row = cur.fetchone()
+    if not row:
+        raise ValueError("mission_not_found")
+        
+    max_cost_usd = row[0]
+    limit = max_cost_usd * PLANNER_BUDGET_FRACTION
+    
+    if estimated_cost_usd > limit:
+        raise ValueError(f"Plan budget {estimated_cost_usd} exceeds {PLANNER_BUDGET_FRACTION*100}% of mission max {max_cost_usd} (Limit: {limit})")
