@@ -16,3 +16,17 @@ MAX_PENDING_PER_TASK = 10
 # Context Injection
 MAX_FILE_TREE_TOKENS = 2000
 MAX_ARTIFACT_TOKENS = 100000  # Default cap for all artifacts combined
+MAX_CONTEXT_TOKENS = 100000  # Default max context budget
+TRUNCATION_MARKER = "... [CONTEXT_TRUNCATED] ..."
+
+# Sandbox & Security
+SANDBOX_TIMEOUT_SECONDS = 300  # 5 minutes (Canonical enforcement)
+SANDBOX_MEMORY_LIMIT = "1g"
+SANDBOX_MEMORY_SWAP = "1g"  # Prevent swap usage
+SANDBOX_PIDS_LIMIT = 100    # Prevent fork bombs
+SANDBOX_USER_UID = "1000:1000"  # Non-root user for Docker
+SANDBOX_CPU_LIMIT = "1"
+SANDBOX_IMAGE_DIGEST = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" # Placeholder digest, must be updated with real one
+MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10MB limit
+MANIFEST_PATH_REGEX = r"^[A-Za-z0-9._ -]+(/[A-Za-z0-9._ -]+)*$"
+CHECKSUM_FORMAT_REGEX = r"^sha256:[0-9a-f]{64}$"
