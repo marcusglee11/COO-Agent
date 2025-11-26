@@ -41,7 +41,10 @@ pip install -r requirements.txt
 export OPENROUTER_API_KEY="your-api-key-here"
 
 # Build sandbox Docker image
-docker build -f docker/Dockerfile.sandbox -t coo-sandbox:latest .
+docker build -f docker/Dockerfile.sandbox -t coo-sandbox:prod .
+
+# Get digest and update governance config (see docs/governance_digest.md)
+docker inspect coo-sandbox:prod --format='{{.Id}}'
 
 # Initialize database
 python -m coo.cli init-db
@@ -166,6 +169,8 @@ The system uses SQLite with the following tables:
 
 ## Security
 
+- **Governance Enforcement**: Runtime verification of image digests and platform constraints
+- **Entrypoint Hardening**: Read-only workspace mounts and symlink purging to prevent TOCTOU attacks
 - **Secret Scrubbing**: Automatic redaction of API keys, passwords, and tokens from logs
 - **Sandbox Isolation**: No network, limited CPU/memory, non-root user
 - **Path Validation**: Filename sanitization to prevent directory traversal
@@ -278,8 +283,13 @@ On restart, call `await self.sandbox.recover_crashed_runs()`.
 
 ### Sandbox Failures
 - Ensure Docker is running: `docker ps`
-- Rebuild sandbox image: `docker build -f docker/Dockerfile.sandbox -t coo-sandbox:latest .`
+- Rebuild sandbox image: `docker build -f docker/Dockerfile.sandbox -t coo-sandbox:prod .`
 - Check logs for timeout/OOM errors
+
+### Governance Violations
+- "Placeholder digest detected": You are running in PROD with a placeholder digest. See `docs/governance_digest.md`.
+- "Unauthorized sandbox digest": The running image digest does not match `ALLOWED_PROD_DIGESTS`.
+- "Windows platform not allowed": PROD mode requires Linux/WSL.
 
 ### Budget Exceeded
 - Increase `max_cost_usd` for mission
