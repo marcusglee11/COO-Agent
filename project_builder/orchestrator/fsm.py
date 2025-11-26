@@ -7,6 +7,8 @@ from project_builder.context.truncation import truncate_repair_context
 
 ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-]+$")
 
+from project_builder.config.governance import enforce_governance
+
 def validate_id(ident: str, name: str):
     if not ident or not ID_PATTERN.match(ident):
         raise ValueError(f"Invalid {name} format: {ident}")
@@ -29,6 +31,10 @@ def start_task_execution(conn: sqlite3.Connection, mission_id: str, task_id: str
     cur = conn.cursor()
     try:
         cur.execute("BEGIN IMMEDIATE;")
+        
+        # Enforce Governance (Inside Transaction)
+        # CRITICAL: Must be enforced while holding the lock to prevent TOCTOU
+        enforce_governance()
         
         # Update status, started_at, and tokenizer_model
         # COALESCE ensures tokenizer is stable if already set

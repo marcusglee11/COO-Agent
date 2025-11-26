@@ -10,8 +10,13 @@ RUN pip install --no-cache-dir numpy pandas requests pytest ipython
 # Disable pip inside container
 USER root
 RUN mv /usr/local/bin/pip /usr/local/bin/pip.disabled
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 USER sandbox
 
 WORKDIR /workspace
 
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["python3"]

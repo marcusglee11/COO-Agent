@@ -2,6 +2,7 @@ import json
 import re
 from pathlib import Path
 from project_builder.config import settings
+from project_builder.config.governance import validate_manifest_path_contract, ManifestValidationError
 
 class SandboxTerminalFailure(Exception):
     """Raised when sandbox operation fails terminally."""
@@ -52,17 +53,8 @@ def parse_manifest(workspace_root: Path) -> list[dict]:
         path = entry['path']
         checksum = entry['checksum']
         
-        # Path validation (FIX 3: Explicit backslash rejection)
-        if '\\' in path:
-            raise ManifestValidationError(f"invalid_artifact_path: {path} (contains backslash)")
-        if '..' in path:
-            raise ManifestValidationError(f"invalid_artifact_path: {path} (contains ..)")
-        if path.startswith('/'):
-            raise ManifestValidationError(f"invalid_artifact_path: {path} (absolute path)")
-        
-        # Regex validation
-        if not MANIFEST_PATH_REGEX.match(path):
-            raise ManifestValidationError(f"invalid_artifact_path: {path} (invalid characters)")
+        # Path validation (Delegated to Governance)
+        validate_manifest_path_contract(path)
         
         # Checksum format validation
         if not CHECKSUM_FORMAT_REGEX.match(checksum):

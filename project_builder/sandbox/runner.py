@@ -14,6 +14,7 @@ except ImportError:
     WATCHDOG_AVAILABLE = False
 
 from . import SecurityViolation
+from project_builder.config.governance import enforce_governance
 
 class InotifyGuard(FileSystemEventHandler if WATCHDOG_AVAILABLE else object):
     """
@@ -46,6 +47,9 @@ def run_sandbox(workspace_root: Path, output_root: Path, entrypoint: str, timeou
     Returns:
         Exit code from container
     """
+    # Enforce Governance
+    enforce_governance()
+
     # Verify Image Digest
     image_ref = f"coo-sandbox@{settings.SANDBOX_IMAGE_DIGEST}"
     

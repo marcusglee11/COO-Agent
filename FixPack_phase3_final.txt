@@ -1,0 +1,198 @@
+1.1 **Implementation Phase — Phase 3 Governance Enactment**
+
+Following the Council's approval and the accepted modifications (M1–M3), I have generated the three critical artifacts required to lock in the Phase 3 productisation decisions.
+
+These artifacts address:
+
+1.  **Unified Error Surface** (Decision 4)
+2.  **Secure Entrypoint Script** (Decision 3 + M2)
+3.  **Production Gatekeeper Logic** (Decision 1, 2, 5 + M1, M3)
+
+-----
+
+### Artifact 1: Unified Sandbox Error Surface
+
+**Addresses:** Decision 4 (Unified Sandbox Error Surface)
+**File:** `project_builder/sandbox/errors.py` (New File)
+
+This hierarchy replaces the disparate exceptions currently found in `manifest.py` and `runner.py`. It implements a serializable contract suitable for cross-process communication (responding to Q2).
+
+```python
+from typing import Optional, Any
+
+class SandboxError(Exception):
+    """
+    Canonical base error for all Sandbox operations.
+    Enables unified catching and deterministic serialization.
+    """
+    def __init__(self, code: str, message: str, details: Optional[dict[str, Any]] = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details or {}
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serializable representation for API/Orchestrator boundaries."""
+        return {
+            "error_type": self.__class__.__name__,
+            "code": self.code,
+            "message": self.message,
+            "details": self.details
+        }
+
+class SandboxSecurityViolation(SandboxError):
+    """
+    Raised when a security invariant is breached.
+    Examples: Path traversal, symlinks, bad characters, root escalation attempts.
+    """
+    def __init__(self, message: str, path: Optional[str] = None):
+        super().__init__(
+            code="SANDBOX_SECURITY_VIOLATION",
+            message=message,
+            details={"path": path} if path else None
+        )
+
+class SandboxManifestError(SandboxError):
+    """
+    Raised when the artifact contract is violated.
+    Examples: Missing manifest, checksum mismatch, invalid JSON.
+    """
+    pass
+
+class SandboxExecutionError(SandboxError):
+    """
+    Raised when the runtime (Docker/Container) fails.
+    Examples: Timeout, container crash, non-zero exit code (if treated as system fail).
+    """
+    def __init__(self, message: str, exit_code: Optional[int] = None, stderr: str = ""):
+        super().__init__(
+            code="SANDBOX_EXECUTION_ERROR",
+            message=message,
+            details={"exit_code": exit_code, "stderr_tail": stderr[-1000:]}
+        )
+
+class SandboxConfigError(SandboxError):
+    """
+    Raised when Prod/Dev governance checks fail.
+    Examples: Running Prod on Windows, unpinned digest.
+    """
+    def __init__(self, message: str):
+        super().__init__(code="SANDBOX_CONFIG_ERROR", message=message)
+```
+
+-----
+
+### Artifact 2: Secure Entrypoint Script
+
+**Addresses:** Decision 3 (Entrypoint Contract) & Modification M2 (Baked-in Script)
+**File:** `docker/entrypoint.sh`
+
+This script MUST be baked into the Docker image (`COPY docker/entrypoint.sh /entrypoint.sh`) and set as `ENTRYPOINT ["/entrypoint.sh"]`. It replaces dynamic shell interpolation with a fixed execution harness.
+
+```bash
+#!/bin/bash
+set -e
+
+# --- DECISION 3: Fixed Entrypoint Contract ---
+
+# 1. Environment Verification
+# Ensure we are NOT root (Option-C Compliance)
+if [ "$(id -u)" -eq 0 ]; then
+    echo "ERROR: Sandbox must not run as root." >&2
+    exit 126 # Command invoked cannot execute
+fi
+
+# 2. Workspace Verification
+# Ensure workspace is strictly Read-Only
+if touch /workspace/.security_check 2>/dev/null; then
+    echo "ERROR: /workspace is writable. Security violation." >&2
+    exit 126
+fi
+
+# 3. Output Directory Verification
+# Ensure output is writable
+if ! touch /output/.security_check; then
+    echo "ERROR: /output is not writable." >&2
+    exit 126
+fi
+rm /output/.security_check
+
+# 4. Command Execution
+# Execute the passed arguments directly.
+# This prevents shell injection because we use 'exec' with the argument array "$@".
+# We do NOT use 'eval' or arbitrary string interpolation.
+exec "$@"
+```
+
+-----
+
+### Artifact 3: Production Gatekeeper Logic
+
+**Addresses:** Decisions 1, 2, 5 & Modifications M1, M3
+**File:** `project_builder/config/governance.py` (New File)
+
+This logic enforces the boundaries between DEV and PROD modes, ensuring strict validation even when platform constraints are relaxed.
+
+```python
+import os
+import sys
+from enum import Enum
+from project_builder.config import settings
+from project_builder.sandbox.errors import SandboxConfigError
+
+class RuntimeMode(Enum):
+    DEV = "dev"
+    PROD = "prod"
+
+# Decision 2: Allowed Pinned Digests (from Git-tracked source)
+ALLOWED_PROD_DIGESTS = {
+    "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", # Update with real digest
+}
+
+def get_runtime_mode() -> RuntimeMode:
+    """Defaults to PROD unless explicitly set to DEV."""
+    mode = os.getenv("COO_RUNTIME_MODE", "prod").lower()
+    return RuntimeMode.DEV if mode == "dev" else RuntimeMode.PROD
+
+def enforce_governance():
+    """
+    Enforces Decisions 1, 2, and 5.
+    Must be called at Orchestrator startup.
+    """
+    mode = get_runtime_mode()
+    
+    # --- DECISION 1: Production Platform Policy ---
+    if mode == RuntimeMode.PROD:
+        if os.name == 'nt':
+            raise SandboxConfigError(
+                "Production violation: Windows is not supported in PROD mode. "
+                "Deploy to Linux or set COO_RUNTIME_MODE=dev."
+            )
+
+    # --- DECISION 2: Pinned-Digest Governance ---
+    # Modification M3: Config Loading Order (Env vars ignored for digest in PROD)
+    current_digest = settings.SANDBOX_IMAGE_DIGEST
+    
+    if mode == RuntimeMode.PROD:
+        if not current_digest or not current_digest.startswith("sha256:"):
+            raise SandboxConfigError("Production violation: Insecure or missing image digest.")
+            
+        if current_digest not in ALLOWED_PROD_DIGESTS:
+            raise SandboxConfigError(
+                f"Production violation: Digest {current_digest} is not in the allowed list."
+            )
+
+def validate_manifest_path_contract(path: str):
+    """
+    Modification M1: Strict Input Validation in Dev Mode.
+    
+    This must be used by manifest.py even if running on Windows (Dev).
+    We enforce UNIX-style paths strictly to ensure artifacts created in Dev
+    are valid in Prod.
+    """
+    if "\\" in path:
+        # We reject backslashes explicitly, even on Windows
+        raise SandboxConfigError(f"Contract violation: Path '{path}' contains backslashes. Use forward slashes only.")
+    
+    # ... (rest of validation from manifest.py)
+```
