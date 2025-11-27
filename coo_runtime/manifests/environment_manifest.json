@@ -1,0 +1,16 @@
+{
+    "allowed_env_vars": [
+        "PATH",
+        "PYTHONPATH",
+        "COO_RUNTIME_MODE",
+        "HOME",
+        "USER"
+    ],
+    "constraints": {
+        "COO_RUNTIME_MODE": [
+            "PROD",
+            "TEST",
+            "DEV"
+        ]
+    }
+}

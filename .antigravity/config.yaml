@@ -1,0 +1,170 @@
+# =====================================================================
+#  Antigravity Global Configuration
+#  Location: .antigravity/config.yaml
+#  Purpose: Define post-build behavior for producing a unified
+#           BUILD_REVIEW_PACKET.txt for StepGate Council review.
+# =====================================================================
+
+global_customization_rules:
+
+  - id: POST_BUILD_REVIEW_PACKET_V1
+    trigger: post_build
+    scope: repo
+    priority: 50
+
+    behavior: |
+      # POST-BUILD REVIEW PACKET GENERATION RULE (SINGLE-FILE OUTPUT)
+
+      ## PURPOSE
+      After every successful incremental build, generate exactly one file:
+      reviews/<build_id>/BUILD_REVIEW_PACKET.txt
+      containing all information required for a Council StepGate review.
+      This output must be self-contained, deterministically ordered,
+      and must not rely on any external artefacts.
+
+      ## REQUIRED CONTENT (STRICT ORDER)
+
+      ### 0. HEADER BLOCK
+      Include:
+        - Build ID
+        - Repository
+        - Branch
+        - Commit SHA
+        - Parent Build ID
+        - Parent Commit SHA
+        - Build Timestamp
+        - Implementation Plan path
+        - Spec and Alignment Layer versions
+        - Build invocation metadata
+
+      ### 1. HIGH-LEVEL SUMMARY
+      Provide 5–12 bullets describing:
+        - What changed in this build
+        - Systems/modules touched
+        - Schema/interface updates
+        - Governance/security/determinism-impacting changes
+        - New configuration or infrastructure introduced
+
+      ### 2. IMPLEMENTATION PLAN SNAPSHOT
+      Extract from the referenced implementation plan:
+        - Title and version
+        - Scope (3–7 bullets)
+        - A structured table:
+
+          Task ID | Task Title | Workstream | Importance | Status in This Build
+
+        Where Status ∈ {Fully Implemented, Partially Implemented, Not Started, Out of Scope}.
+
+      ### 3. TASK-BY-TASK WALKTHROUGH (PLAN → CODE → TESTS)
+      For each fully or partially implemented task:
+
+        #### 3A. TASK HEADER
+          - Task ID
+          - Task Title
+          - Shortened Description
+          - Acceptance Criteria (if any)
+
+        #### 3B. CODE MAPPING
+          For each associated file:
+            - File path
+            - Status: {new, modified}
+            - One-sentence summary of the change
+            - Functions or line ranges affected (best effort)
+
+        #### 3C. TEST MAPPING
+          For all linked tests:
+            - test_path::test_name
+            - Result: {pass, fail}
+            - For failures: short error description
+
+        #### 3D. NOTES
+          - TODO/FIXME items
+          - Partial implementations
+          - Gaps relative to acceptance criteria
+
+      ### 4. FLATTENED CODEBASE SNAPSHOT (THIS BUILD ONLY)
+
+        #### 4A. SUMMARY STATISTICS
+          - Total file count
+          - Files by type (code/test/config/docs/etc)
+          - New/Modified/Unchanged counts
+          - Top N largest files (≤20)
+          - Top N most-changed files
+
+        #### 4B. FULL FLATTENED LISTING
+          Alphabetical order. For each file:
+            <path> | <kind> | <language> | <size_bytes> | <status>
+
+        #### 4C. DELETED FILES
+          List removed files with prior size if known.
+
+      ### 5. DIFF AND CHANGE SURFACE SUMMARY
+
+        #### 5A. DIRECTORY LEVEL SUMMARY
+          For each directory:
+            - Files added
+            - Files modified
+            - Files removed
+            - Lines added/removed
+
+        #### 5B. PER-FILE SUMMARY
+          For each changed file:
+            - Path
+            - Lines added/removed
+            - Semantic summary of the change
+
+        #### 5C. SENSITIVE SURFACE FLAGS
+          Flag any change touching:
+            - Determinism boundaries
+            - Governance logic
+            - Sandbox/security policy
+            - Runtime FSM
+            - Migration logic
+            - Path validation
+            - External integrations
+
+      ### 6. TESTS, CHECKS, QUALITY GATES
+
+        #### 6A. OVERALL STATUS
+          - All Passing
+          - Some Failing
+          - Critical Failures
+
+        #### 6B. SUITE SUMMARY TABLE
+          Suite | Status | Pass | Fail | Notes
+
+        #### 6C. FAILING TESTS
+          - test_path::test_name
+          - Short error message
+          - Suspected module
+          - Whether new or pre-existing
+
+        #### 6D. NON-TEST CHECKS
+          Summaries for:
+            - Linting
+            - Type checks
+            - Static analysis
+            - Security scans
+
+      ### 7. COUNCIL REVIEW HOOKS (NON-NORMATIVE)
+        Provide:
+
+        #### 7A. SUGGESTED REVIEW FOCUS
+          3–7 points (FSM, sandbox, determinism, migration logic, etc).
+
+        #### 7B. RELEVANT ROLES
+          Architect, Technical, Alignment, Risk/Adversarial, Simplicity (optional).
+
+        #### 7C. KEY QUESTIONS
+          3–7 neutral questions to focus Council review.
+
+        #### 7D. KNOWN AMBIGUITIES
+          Where plan→code mapping or test coverage is uncertain.
+
+      ## BEHAVIORAL REQUIREMENTS
+        - Output must be deterministic (bit-for-bit identical given identical inputs).
+        - Must not introduce governance or approval actions.
+        - Must not require external artefacts.
+        - All details must exist fully inside BUILD_REVIEW_PACKET.txt.
+
+      ## END OF RULE

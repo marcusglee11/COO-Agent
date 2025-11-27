@@ -1,0 +1,15 @@
+{
+  "allowed_tools": [
+    {
+      "name": "python",
+      "version": "3.12",
+      "sha256": "SHA256_OF_PYTHON_EXECUTABLE_PLACEHOLDER"
+    },
+    {
+      "name": "git",
+      "version": "2.x",
+      "sha256": "SHA256_OF_GIT_EXECUTABLE_PLACEHOLDER"
+    }
+  ],
+  "governance_ruleset_sha256": "SHA256_OF_GOVERNANCE_RULESET_PLACEHOLDER"
+}
