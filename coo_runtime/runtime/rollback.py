@@ -1,6 +1,9 @@
 import logging
 import os
 import shutil
+import json
+import hashlib
+from typing import Optional
 from .state_machine import RuntimeFSM, RuntimeState, GovernanceError
 
 class RollbackEngine:
@@ -50,26 +53,44 @@ class RollbackEngine:
     def _verify_amu0_signature(self) -> None:
         """
         Verifies the CEO's cryptographic signature on the AMU0 bundle.
+        Uses Ed25519. No DEV-mode bypass - signature verification always required.
         """
         self.logger.info("Verifying CEO Signature on AMU0...")
+        
+        from ..util.crypto import verify_signature
         
         amu_dir = "amu0_capture"
         sig_path = os.path.join(amu_dir, "signature.sig")
         
         if not os.path.exists(sig_path):
-             raise GovernanceError("AMU0 Signature Missing")
-
-        # Check mode
-        strict_mode = os.environ.get("COO_STRICT_MODE", "0") == "1"
+            raise GovernanceError("AMU0 Signature Missing")
         
-        if strict_mode:
-            # In STRICT mode, we would load the real public key and verify.
-            # For this implementation, we simulate it but require the file to be valid.
-            # raise GovernanceError("Real signature verification not implemented")
-            pass
-        else:
-            # In DEV mode, we allow a test key or just presence.
-            self.logger.info("DEV MODE: Signature presence verified (skipping crypto check).")
+        # Read signature (raw bytes)
+        with open(sig_path, "rb") as f:
+            signature = f.read()
+            
+        # Re-calculate canonical hash to verify
+        manifest_path = os.path.join(amu_dir, "snapshot_manifest.json")
+        context_path = os.path.join(amu_dir, "pinned_context.json")
+        
+        hasher = hashlib.sha256()
+        
+        # Hash files in sorted order (same as signing)
+        for filepath in sorted([manifest_path, context_path]):
+            if os.path.exists(filepath):
+                with open(filepath, "rb") as f:
+                    hasher.update(f.read())
+        
+        canonical_hash = hasher.digest()
+        
+        # Verify signature using CEO public key (resolve absolute path)
+        script_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        public_key_path = os.path.join(script_dir, "coo_runtime", "manifests", "ceo_public_key.pem")
+        
+        if not verify_signature(public_key_path, canonical_hash, signature):
+            raise GovernanceError("AMU0 Signature Verification Failed")
+        
+        self.logger.info("AMU0 Signature verified successfully.")
 
     def _restore_from_amu0(self) -> None:
         """
@@ -86,24 +107,50 @@ class RollbackEngine:
         # And potentially a snapshot of 'project_builder' if we need to restore it.
         # If PB was deleted, we need to restore it.
         
-        # For this fix pack, we assume we are running locally and 'project_builder' might have been deleted.
-        # If we didn't snapshot PB into AMU0, we can't restore it!
-        # The spec says AMU0 includes "Full filesystem snapshot".
-        # So we assume there is a 'fs_snapshot' dir in AMU0.
-        
-        fs_snapshot = os.path.join(amu_dir, "fs_snapshot")
-        if os.path.exists(fs_snapshot):
-            # Restore PB
-            pb_src = os.path.join(fs_snapshot, "project_builder")
-            if os.path.exists(pb_src):
-                if os.path.exists("project_builder"):
-                    shutil.rmtree("project_builder")
-                shutil.copytree(pb_src, "project_builder")
-                self.logger.info("Restored project_builder/")
+        # Verify Snapshot Integrity
+        manifest_path = os.path.join(amu_dir, "snapshot_manifest.json")
+        if not os.path.exists(manifest_path):
+             raise GovernanceError("AMU0 Snapshot Manifest Missing. Cannot rollback safely.")
+             
+        with open(manifest_path, "r") as f:
+            snapshot_manifest = json.load(f)
             
-            # Restore coo (if we want to wipe partial migration)
-            if os.path.exists("coo"):
-                shutil.rmtree("coo")
-                self.logger.info("Cleaned up partial coo/")
-        else:
-            self.logger.warning("No FS snapshot in AMU0. Rollback might be incomplete.")
+        snapshot_root = os.path.join(amu_dir, "fs_snapshot")
+        if not os.path.exists(snapshot_root):
+             raise GovernanceError("AMU0 Filesystem Snapshot Missing. Cannot rollback safely.")
+             
+        # Verify hashes
+        self.logger.info("Verifying Snapshot Integrity...")
+        for rel_path, expected_hash in snapshot_manifest.items():
+            # rel_path is relative to repo root, but in snapshot it's under fs_snapshot
+            # Wait, _snapshot_filesystem stored full paths or relative?
+            # It stored relative to repo root.
+            # And structure in fs_snapshot mirrors repo root.
+            # So if rel_path is "project_builder/main.py", it is at "amu0_capture/fs_snapshot/project_builder/main.py"
+            
+            snapshot_file_path = os.path.join(snapshot_root, rel_path)
+            if not os.path.exists(snapshot_file_path):
+                 raise GovernanceError(f"Snapshot Corrupt: Missing file {rel_path}")
+                 
+            with open(snapshot_file_path, "rb") as f:
+                actual_hash = hashlib.sha256(f.read()).hexdigest()
+                
+            if actual_hash != expected_hash:
+                 raise GovernanceError(f"Snapshot Corrupt: Hash mismatch for {rel_path}")
+                 
+        self.logger.info("Snapshot Integrity Verified.")
+
+        # Restore from Snapshot
+        # We restore everything in the snapshot to the repo root.
+        for item in os.listdir(snapshot_root):
+            src = os.path.join(snapshot_root, item)
+            dest = os.path.join(os.getcwd(), item)
+            
+            if os.path.isdir(src):
+                if os.path.exists(dest):
+                    shutil.rmtree(dest)
+                shutil.copytree(src, dest)
+                self.logger.info(f"Restored directory: {item}")
+            else:
+                shutil.copy2(src, dest)
+                self.logger.info(f"Restored file: {item}")

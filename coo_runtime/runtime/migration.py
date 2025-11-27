@@ -25,6 +25,15 @@ class MigrationEngine:
         """
         self.fsm.assert_state(RuntimeState.MIGRATION_SEQUENCE)
         self.logger.info("Starting Migration Phase 1 (Steps 1-5, 7)")
+        
+        # B2: Enforce pinned context before migration
+        from ..util.context import apply_pinned_context
+        try:
+            apply_pinned_context("amu0_capture/pinned_context.json")
+            self.logger.info("Pinned context applied successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to apply pinned context: {e}")
+            raise GovernanceError(f"Pinned context enforcement failed: {e}")
 
         try:
             # Step 1: Create canonical coo/ tree

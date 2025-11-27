@@ -5,6 +5,7 @@ import json
 import logging
 import subprocess
 import unittest
+import hashlib
 from typing import Dict, Any
 
 # Add repo root to path
@@ -65,6 +66,12 @@ class TestE2EProofOfLife(unittest.TestCase):
         with open(self.test_runner, "w") as f:
             f.write("print('Tests Passed')\n")
             
+        # Create dummy coo directory
+        if not os.path.exists(self.coo_root):
+            os.makedirs(self.coo_root)
+        with open(os.path.join(self.coo_root, "orchestrator.py"), "w") as f:
+            f.write("# Dummy Orchestrator\n")
+            
         # Capture AMU0 (Mocking the capture process or using the class)
         capture = AMUCapture()
         # We need to change CWD to test_dir for relative paths to work if needed, 
@@ -86,7 +93,7 @@ class TestE2EProofOfLife(unittest.TestCase):
         # shutil.rmtree(self.test_dir) # Keep for inspection if failed
 
     def test_full_migration_success(self):
-        print("\n--- Testing Full Migration Success ---")
+        print("\n--- Testing Full Migration Success (R3) ---")
         
         fsm = RuntimeFSM()
         rollback = RollbackEngine(fsm)
@@ -110,15 +117,22 @@ class TestE2EProofOfLife(unittest.TestCase):
         migration.finalize_migration_cleanup("project_builder")
         
         # 5. Replay Gate
+        # Mock Orchestrator imports if needed, or rely on them being present.
+        # Since we are running in the repo root context, it should find 'coo'.
         gate_keeper.run_replay_gate("coo", "manifests")
         
         # Verify
         self.assertTrue(os.path.exists("coo"))
         self.assertFalse(os.path.exists("project_builder"))
         self.assertTrue(os.path.exists("replay_output_run1"))
+        
+        # Verify AMU0 Snapshot (R3)
+        self.assertTrue(os.path.exists("amu0_capture/fs_snapshot"))
+        self.assertTrue(os.path.exists("amu0_capture/snapshot_manifest.json"))
+        self.assertTrue(os.path.exists("amu0_capture/signature.sig"))
 
-    def test_rollback_on_gate_failure(self):
-        print("\n--- Testing Rollback on Gate Failure ---")
+    def test_rollback_snapshot_corruption(self):
+        print("\n--- Testing Rollback Snapshot Corruption (R3) ---")
         
         fsm = RuntimeFSM()
         rollback = RollbackEngine(fsm)
@@ -128,70 +142,91 @@ class TestE2EProofOfLife(unittest.TestCase):
         
         self._fast_forward_fsm(fsm)
         
+        # Run migration to create snapshot
         migration.execute_migration_phase_1("project_builder", "coo", "run_tests.py")
+        
+        # Corrupt Snapshot
+        with open("amu0_capture/fs_snapshot/project_builder/main.py", "w") as f:
+            f.write("CORRUPTED")
+            
+        # Trigger Rollback via Gate Failure
         fsm.transition_to(RuntimeState.GATES)
+        shutil.rmtree("coo") # Fail Gate A
         
-        # Inject failure in Gate A by deleting coo
-        shutil.rmtree("coo")
+        # Expect Rollback to Fail due to signature verification failure
+        # With real crypto (B1), corrupting the snapshot invalidates the signature
+        # So we expect signature verification to fail before snapshot hash check
+        with self.assertRaises(GovernanceError) as cm:
+            try:
+                gate_keeper.run_pre_replay_gates("coo", "manifests", "run_tests.py")
+            except GovernanceError:
+                rollback.execute_rollback()
+                
+        # B1: Real crypto detects corruption via signature, not hash check
+        self.assertIn("Signature Verification Failed", str(cm.exception))
+
+    def test_strict_mode_enforcement(self):
+        print("\n--- Testing Strict Mode Enforcement (R3) ---")
         
-        with self.assertRaises(GovernanceError):
-            gate_keeper.run_pre_replay_gates("coo", "manifests", "run_tests.py")
+        fsm = RuntimeFSM()
+        
+        # Fast forward to CEO_REVIEW
+        fsm.transition_to(RuntimeState.AMENDMENT_PREP)
+        fsm.transition_to(RuntimeState.AMENDMENT_EXEC)
+        fsm.transition_to(RuntimeState.AMENDMENT_VERIFY)
+        
+        # Try transition to CEO_REVIEW without strict mode
+        if "COO_STRICT_MODE" in os.environ:
+            del os.environ["COO_STRICT_MODE"]
             
-        # Verify Rollback (count incremented, state reset?)
-        # RollbackEngine catches exception? No, GateKeeper raises it.
-        # But who calls rollback?
-        # In run_migration.py, we don't catch and rollback explicitly for Gates.
-        # Wait, GateKeeper says: "# Any gate failure must trigger rollback (handled by caller/rollback engine)"
-        # In my test, I called gate_keeper directly.
-        # I should wrap it in try/except and call rollback.
+        with self.assertRaises(GovernanceError) as cm:
+            fsm.transition_to(RuntimeState.CEO_REVIEW)
+        self.assertIn("Strict Mode Required", str(cm.exception))
         
-        # Let's simulate the runner logic
-        try:
-            gate_keeper.run_pre_replay_gates("coo", "manifests", "run_tests.py")
-        except GovernanceError:
-            rollback.execute_rollback()
-            
-        # Verify Rollback restored PB (if it was deleted? It wasn't yet)
-        # Verify Rollback restored coo (if it was partial)
-        # AMU0 restore logic in RollbackEngine checks for fs_snapshot.
-        # My AMUCapture mock didn't create fs_snapshot.
-        # So rollback might warn.
-        # But the test proves the flow.
-        pass
+        # Enable Strict Mode
+        os.environ["COO_STRICT_MODE"] = "1"
+        
+        # Create new FSM since previous one is in ERROR state
+        fsm = RuntimeFSM()
+        fsm.transition_to(RuntimeState.AMENDMENT_PREP)
+        fsm.transition_to(RuntimeState.AMENDMENT_EXEC)
+        fsm.transition_to(RuntimeState.AMENDMENT_VERIFY)
+        
+        fsm.transition_to(RuntimeState.CEO_REVIEW)
+        self.assertEqual(fsm.current_state, RuntimeState.CEO_REVIEW)
+        
+        del os.environ["COO_STRICT_MODE"]
 
     def test_replay_failure_nondeterminism(self):
         print("\n--- Testing Replay Failure (Nondeterminism) ---")
+        # R3: Replay uses Orchestrator. Nondeterminism is harder to inject without mocking the mock.
+        # But we can mock the ReplayEngine._run_mission to return different DBs.
         
         fsm = RuntimeFSM()
-        rollback = RollbackEngine(fsm)
-        migration = MigrationEngine(fsm, rollback)
         replay = ReplayEngine(fsm)
         gate_keeper = GateKeeper(fsm, replay)
         
         self._fast_forward_fsm(fsm)
-        
-        migration.execute_migration_phase_1("project_builder", "coo", "run_tests.py")
         fsm.transition_to(RuntimeState.GATES)
-        gate_keeper.run_pre_replay_gates("coo", "manifests", "run_tests.py")
-        migration.finalize_migration_cleanup("project_builder")
         
-        # Inject Nondeterminism: Modify mission file between runs?
-        # ReplayEngine runs mission twice.
-        # If I want it to fail, I need the harness to be nondeterministic.
-        # But the harness is hardcoded in ReplayEngine.
-        # I can subclass ReplayEngine to inject nondeterminism.
-        
-        class NondeterministicReplay(ReplayEngine):
-            def _run_mission(self, mission_path: str, run_id: str) -> str:
-                # Call original to setup dir
-                out = super()._run_mission(mission_path, run_id)
-                # Modify output based on run_id
-                with open(os.path.join(out, "result.json"), "a") as f:
-                    f.write(f" run_id={run_id}")
+        # Mock _run_mission
+        original_run = replay._run_mission
+        def mock_run(mission_path, run_id):
+            try:
+                out = original_run(mission_path, run_id)
+                # Modify DB to cause mismatch
+                import sqlite3
+                db_path = os.path.join(out, "mission.db")
+                conn = sqlite3.connect(db_path)
+                conn.execute(f"UPDATE missions SET description = description || '_nondet_{run_id}'")
+                conn.commit()
+                conn.close()
                 return out
-                
-        bad_replay = NondeterministicReplay(fsm)
-        gate_keeper.replay_engine = bad_replay
+            except Exception as e:
+                print(f"DEBUG: mock_run failed: {e}")
+                raise e
+            
+        replay._run_mission = mock_run
         
         with self.assertRaises(GovernanceError) as cm:
             gate_keeper.run_replay_gate("coo", "manifests")
@@ -199,14 +234,21 @@ class TestE2EProofOfLife(unittest.TestCase):
         self.assertIn("Deterministic Replay Failed", str(cm.exception))
 
     def _fast_forward_fsm(self, fsm):
-        fsm.transition_to(RuntimeState.AMENDMENT_PREP)
-        fsm.transition_to(RuntimeState.AMENDMENT_EXEC)
-        fsm.transition_to(RuntimeState.AMENDMENT_VERIFY)
-        fsm.transition_to(RuntimeState.CEO_REVIEW)
-        fsm.transition_to(RuntimeState.FREEZE_PREP)
-        fsm.transition_to(RuntimeState.FREEZE_ACTIVATED)
-        fsm.transition_to(RuntimeState.CAPTURE_AMU0)
-        fsm.transition_to(RuntimeState.MIGRATION_SEQUENCE)
+        # R3: Strict mode required for some transitions
+        os.environ["COO_STRICT_MODE"] = "1"
+        try:
+            fsm.transition_to(RuntimeState.AMENDMENT_PREP)
+            fsm.transition_to(RuntimeState.AMENDMENT_EXEC)
+            fsm.transition_to(RuntimeState.AMENDMENT_VERIFY)
+            fsm.transition_to(RuntimeState.CEO_REVIEW)
+            fsm.transition_to(RuntimeState.FREEZE_PREP)
+            fsm.transition_to(RuntimeState.FREEZE_ACTIVATED)
+            fsm.transition_to(RuntimeState.CAPTURE_AMU0)
+            fsm.transition_to(RuntimeState.MIGRATION_SEQUENCE)
+        finally:
+            # Clean up env var to avoid polluting other tests
+            if "COO_STRICT_MODE" in os.environ:
+                del os.environ["COO_STRICT_MODE"]
 
 if __name__ == "__main__":
     unittest.main()

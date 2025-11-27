@@ -54,14 +54,87 @@ class AMUCapture:
         # 3. Capture Manifests
         shutil.copytree(manifests_dir, os.path.join(amu_dir, "manifests"))
 
-        # 4. Capture Filesystem Snapshot (Mocked for now, usually rsync or similar)
-        # self._snapshot_filesystem(amu_dir)
+        # 4. Capture Filesystem Snapshot
+        self._snapshot_filesystem(amu_dir)
 
         # 5. Capture DB Dump (Mocked)
         # self._dump_database(amu_dir)
+        
+        # 6. Sign AMU0
+        self._sign_amu0(amu_dir)
 
         self.logger.info(f"AMU0 Captured at {amu_dir}")
         return amu_dir
+    
+    def _snapshot_filesystem(self, amu_dir: str) -> None:
+        """
+        Snapshots critical directories (PB, COO, Manifests) and generates a hash manifest.
+        """
+        self.logger.info("Snapshotting filesystem...")
+        snapshot_root = os.path.join(amu_dir, "fs_snapshot")
+        os.makedirs(snapshot_root)
+        
+        targets = ["project_builder", "coo", "manifests"]
+        file_hashes = {}
+        
+        for target in targets:
+            if os.path.exists(target):
+                dest = os.path.join(snapshot_root, target)
+                if os.path.isdir(target):
+                    shutil.copytree(target, dest)
+                    # Hash all files
+                    for root, _, files in os.walk(target):
+                        for file in files:
+                            path = os.path.join(root, file)
+                            rel_path = os.path.relpath(path, os.getcwd())
+                            with open(path, "rb") as f:
+                                file_hashes[rel_path] = hashlib.sha256(f.read()).hexdigest()
+                else:
+                    shutil.copy2(target, dest)
+                    with open(target, "rb") as f:
+                        file_hashes[target] = hashlib.sha256(f.read()).hexdigest()
+            else:
+                self.logger.warning(f"Snapshot target missing: {target}")
+
+        # Write snapshot manifest
+        with open(os.path.join(amu_dir, "snapshot_manifest.json"), "w") as f:
+            json.dump(file_hashes, f, indent=2, sort_keys=True)
+    
+    def _sign_amu0(self, amu_dir: str) -> None:
+        """
+        Signs the AMU0 bundle using Ed25519.
+        Uses CEO private key from coo_runtime/manifests/ceo_private_key.pem.
+        No DEV-mode bypass - signature always required.
+        """
+        self.logger.info("Signing AMU0 with Ed25519...")
+        
+        from ..util.crypto import sign_bytes
+        
+        # Calculate canonical hash of all AMU0 files in sorted order
+        manifest_path = os.path.join(amu_dir, "snapshot_manifest.json")
+        context_path = os.path.join(amu_dir, "pinned_context.json")
+        
+        hasher = hashlib.sha256()
+        
+        # Hash files in sorted order for determinism
+        for filepath in sorted([manifest_path, context_path]):
+            if os.path.exists(filepath):
+                with open(filepath, "rb") as f:
+                    hasher.update(f.read())
+        
+        canonical_hash = hasher.digest()
+        
+        # Sign using CEO private key (resolve absolute path)
+        script_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        private_key_path = os.path.join(script_dir, "coo_runtime", "manifests", "ceo_private_key.pem")
+        signature = sign_bytes(private_key_path, canonical_hash)
+        
+        # Write signature (raw bytes)
+        sig_path = os.path.join(amu_dir, "signature.sig")
+        with open(sig_path, "wb") as f:
+            f.write(signature)
+        
+        self.logger.info(f"AMU0 signed: {sig_path}")
 
     def _capture_pinned_context(self, manifests_dir: str) -> Dict[str, Any]:
         """
