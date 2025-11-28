@@ -1,110 +1,124 @@
-"""
-Pinned context enforcement utilities for COO Runtime.
-Enforces deterministic environment: RNG seed, env vars, mock time, hardware verification.
-"""
 import os
+import sys
 import json
 import random
 import platform
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from ..runtime.state_machine import GovernanceError
 
-def apply_pinned_context(pinned_context_path: str) -> None:
+def enforce_pinned_context_or_fail(amu0_path: str) -> Dict[str, str]:
     """
-    Apply pinned context to enforce deterministic environment.
+    Enforce pinned context strictly. Fail if any mismatch occurs.
+    Returns the pinned environment dictionary for use in subprocesses.
+    Does NOT mutate the global os.environ (R6 B.2).
     
     Enforces:
+    - Platform (Linux-only)
     - RNG seed
-    - Environment variable allowlist
+    - Environment variable allowlist (Fail-Closed)
     - Mock time (via FAKETIME)
-    - Hardware context verification
+    - Hardware context verification (Fail-Closed)
     
     Args:
-        pinned_context_path: Path to pinned_context.json
+        amu0_path: Path to AMU0 directory containing pinned_context.json
+        
+    Returns:
+        Dict[str, str]: The constructed environment dictionary.
         
     Raises:
-        GovernanceError: If context mismatch detected
+        GovernanceError: If context mismatch detected or files missing.
     """
-    with open(pinned_context_path, "r") as f:
-        ctx = json.load(f)
+    # 0. Platform Check (R6 B.2)
+    if sys.platform != "linux":
+        raise GovernanceError(f"Unsupported platform: {sys.platform}. COO Runtime R6 is Linux-only.")
+
+    context_path = os.path.join(amu0_path, "pinned_context.json")
+    if not os.path.exists(context_path):
+        raise GovernanceError("Pinned context file missing from AMU0.")
+        
+    try:
+        with open(context_path, "r") as f:
+            ctx = json.load(f)
+    except json.JSONDecodeError:
+        raise GovernanceError("Pinned context file corrupted.")
 
     # 1. RNG Seed
-    rng_seed = ctx.get("rng_seed", "DETERMINISTIC_SEED_DEFAULT")
+    rng_seed = ctx.get("rng_seed")
+    if rng_seed is None:
+        raise GovernanceError("RNG seed missing from pinned context.")
     random.seed(rng_seed)
 
-    # 2. ENV VARS (replace all non-allowed vars)
-    # Store original env for later restoration if needed
+    # 2. ENV VARS (Fail-Closed)
     allowed_env_vars = ctx.get("env_vars", {})
     
-    # Clear environment and set only allowed vars
-    os.environ.clear()
+    # Construct new env dict (Do not mutate os.environ)
+    pinned_env = {}
     for k, v in allowed_env_vars.items():
-        os.environ[k] = str(v)
-
-    # 3. Mock time (if specified)
+        pinned_env[k] = str(v)
+        
+    # 3. Mock time
     mock_time = ctx.get("mock_time")
     if mock_time is not None:
-        # Use FAKETIME environment variable for libfaketime
-        os.environ["FAKETIME"] = mock_time
-        os.environ["COO_MOCK_TIME"] = mock_time  # Also set our internal mock time
-
-    # 4. Hardware Context Verification
+        pinned_env["FAKETIME"] = mock_time
+        pinned_env["COO_MOCK_TIME"] = mock_time
+    
+    # 4. Hardware Context Verification (F6)
     _verify_hardware_context(ctx)
+    
+    return pinned_env
 
 
 def _verify_hardware_context(ctx: Dict[str, Any]) -> None:
     """
-    Verify hardware properties match pinned context.
+    Verify hardware properties match pinned context strictly.
     
     Checks:
-    - Kernel version
-    - CPU microcode (if available)
-    - NUMA topology (if available)
+    - Kernel version (Fail if UNKNOWN or mismatch)
+    - CPU microcode (Fail if UNKNOWN or mismatch)
     
     Raises:
         GovernanceError: If hardware mismatch detected
     """
     # Verify kernel version
-    pinned_kernel = ctx.get("kernel_version", "UNKNOWN")
+    pinned_kernel = ctx.get("kernel_version")
+    if pinned_kernel == "UNKNOWN" or pinned_kernel is None:
+        raise GovernanceError("Pinned kernel version is UNKNOWN or missing. Hardware verification failed.")
+        
     actual_kernel = platform.release()
-    
-    if pinned_kernel != "UNKNOWN" and pinned_kernel != actual_kernel:
+    if pinned_kernel != actual_kernel:
         raise GovernanceError(
             f"Hardware context mismatch: Kernel version mismatch. "
             f"Expected: {pinned_kernel}, Actual: {actual_kernel}"
         )
     
     # CPU microcode verification
-    pinned_microcode = ctx.get("cpu_microcode", "UNKNOWN")
-    if pinned_microcode != "UNKNOWN":
-        # Try to read actual microcode (Linux-specific)
-        actual_microcode = _read_cpu_microcode()
-        if actual_microcode and actual_microcode != pinned_microcode:
-            raise GovernanceError(
-                f"Hardware context mismatch: CPU microcode mismatch. "
-                f"Expected: {pinned_microcode}, Actual: {actual_microcode}"
-            )
-    
-    # NUMA topology verification
-    pinned_numa = ctx.get("numa_topology", "UNKNOWN")
-    if pinned_numa != "UNKNOWN":
-        # Simple check - in production this would be more thorough
-        pass  # Skip for now - requires platform-specific tooling
+    pinned_microcode = ctx.get("cpu_microcode")
+    if pinned_microcode == "UNKNOWN" or pinned_microcode is None:
+         raise GovernanceError("Pinned CPU microcode is UNKNOWN or missing. Hardware verification failed.")
 
+    actual_microcode = _read_cpu_microcode()
+    if not actual_microcode:
+         # If we can't read it, we can't verify. Fail-closed.
+         raise GovernanceError("Could not read actual CPU microcode for verification.")
+         
+    if actual_microcode != pinned_microcode:
+        raise GovernanceError(
+            f"Hardware context mismatch: CPU microcode mismatch. "
+            f"Expected: {pinned_microcode}, Actual: {actual_microcode}"
+        )
 
 def _read_cpu_microcode() -> str:
     """
-    Read CPU microcode from /proc/cpuinfo (Linux) or equivalent.
+    Read CPU microcode from /proc/cpuinfo (Linux).
     
     Returns:
         Microcode version string or empty string if unavailable
     """
     try:
-        if platform.system() == "Linux":
-            with open("/proc/cpuinfo", "r") as f:
-                for line in f:
-                    if "microcode" in line.lower():
-                        return line.split(":")[-1].strip()
+        with open("/proc/cpuinfo", "r") as f:
+            for line in f:
+                if "microcode" in line.lower():
+                    return line.split(":")[-1].strip()
     except (FileNotFoundError, PermissionError):
         pass
     

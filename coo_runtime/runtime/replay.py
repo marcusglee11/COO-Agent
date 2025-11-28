@@ -1,43 +1,56 @@
 import logging
 import os
+import sys
 import hashlib
-import filecmp
 import shutil
 import json
+import subprocess
 from .state_machine import RuntimeFSM, RuntimeState, GovernanceError
+from ..util.context import enforce_pinned_context_or_fail
+from ..util.output_bundle import create_output_bundle
+from ..util import amu0_utils
 
 class ReplayEngine:
     """
     Executes Deterministic Replay (Gate F).
     1. Verifies Reference Mission SHA against AMU0.
     2. Runs mission twice in locked context.
-    3. Compares outputs byte-for-byte.
+    3. Compares outputs byte-for-byte (Output Bundle).
     """
 
     def __init__(self, fsm: RuntimeFSM):
         self.fsm = fsm
         self.logger = logging.getLogger("ReplayEngine")
 
-    def execute_replay(self, mission_path: str, amu0_path: str) -> None:
+    def execute_replay(self, mission_path: str, amu0_path: str, mode: str = "fast") -> None:
         """
         Executes the replay sequence.
+        Args:
+            mission_path: Path to reference mission
+            amu0_path: Path to AMU0
+            mode: "fast" (mocked) or "deep" (trace-based)
         """
         self.fsm.assert_state(RuntimeState.GATES)
-        self.logger.info("Starting Deterministic Replay (Gate F)")
+        self.logger.info(f"Starting Deterministic Replay (Gate F) - Mode: {mode}")
 
         # 1. Verify Reference Mission SHA
         self._verify_reference_mission(mission_path, amu0_path)
 
-        # 2. Run 1
+        # 2. Enforce Pinned Context (F2, R6 B.2)
+        # We must enforce the environment captured in AMU0.
+        self.logger.info("Enforcing Pinned Context from AMU0...")
+        pinned_env = enforce_pinned_context_or_fail(amu0_path)
+
+        # 3. Run 1
         self.logger.info("Replay Run 1...")
-        output1 = self._run_mission(mission_path, "run1")
+        output1 = self._run_mission(mission_path, "run1", pinned_env, amu0_path, mode)
 
-        # 3. Run 2
+        # 4. Run 2
         self.logger.info("Replay Run 2...")
-        output2 = self._run_mission(mission_path, "run2")
+        output2 = self._run_mission(mission_path, "run2", pinned_env, amu0_path, mode)
 
-        # 4. Compare
-        self.logger.info("Comparing Outputs...")
+        # 5. Compare (F7)
+        self.logger.info("Comparing Outputs (Byte-for-Byte)...")
         if not self._compare_outputs(output1, output2):
              raise GovernanceError("Deterministic Replay Failed: Outputs do not match byte-for-byte.")
 
@@ -63,44 +76,48 @@ class ReplayEngine:
         if current_sha != amu_sha:
             raise GovernanceError("Replay Mission Mismatch: SHA256 does not match AMU0 locked version.")
 
-    def _run_mission(self, mission_path: str, run_id: str) -> str:
+    def _run_mission(self, mission_path: str, run_id: str, env: dict, amu0_path: str, mode: str) -> str:
         """
-        Runs the mission in the locked context.
-        Returns path to output directory/file.
+        Runs the mission in the locked context using the Replay Harness subprocess.
+        Returns path to output directory.
         """
         output_dir = f"replay_output_{run_id}"
-        if os.path.exists(output_dir):
-            shutil.rmtree(output_dir)
-        os.makedirs(output_dir)
+        
+        # Harness script path
+        harness_path = os.path.join(os.path.dirname(__file__), "replay_harness.py")
+        if not os.path.exists(harness_path):
+            raise GovernanceError(f"Replay Harness missing at {harness_path}")
 
-        # Deterministic Harness
-        # In a real implementation, this would invoke the Orchestrator.
-        # Here, we simulate deterministic output based on input SHA + Context.
+        self.logger.info(f"Launching Replay Harness for {run_id}...")
         
-        with open(mission_path, "rb") as f:
-            mission_content = f.read()
-            
-        # Simulate processing
-        result_hash = hashlib.sha256(mission_content).hexdigest()
-        
-        # Write result
-        with open(os.path.join(output_dir, "result.json"), "w") as f:
-            json.dump({"status": "success", "hash": result_hash}, f, sort_keys=True)
-            
+        try:
+            # Run harness in subprocess with pinned environment (R6 B.2)
+            subprocess.run(
+                [sys.executable, harness_path, mission_path, output_dir, "--amu0", amu0_path, "--mode", mode],
+                check=True,
+                env=env,
+                capture_output=True,
+                text=True
+            )
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"Replay Harness Failed: {e.stdout}\n{e.stderr}")
+            raise GovernanceError(f"Replay Execution Failed (Subprocess): {e}")
+
         return output_dir
 
     def _compare_outputs(self, out1: str, out2: str) -> bool:
         """
-        Byte-for-byte comparison.
+        Strict byte-for-byte comparison of output bundles (F7).
         """
-        dc = filecmp.dircmp(out1, out2)
-        if dc.left_only or dc.right_only:
-            return False
+        try:
+            hash1 = create_output_bundle(out1)
+            hash2 = create_output_bundle(out2)
             
-        for filename in dc.common_files:
-            f1 = os.path.join(out1, filename)
-            f2 = os.path.join(out2, filename)
-            if not filecmp.cmp(f1, f2, shallow=False):
+            if hash1 != hash2:
+                self.logger.error(f"Bundle Hash Mismatch: {hash1.hex()} vs {hash2.hex()}")
                 return False
                 
-        return True
+            return True
+        except Exception as e:
+            self.logger.error(f"Comparison failed: {e}")
+            return False

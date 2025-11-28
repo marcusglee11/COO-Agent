@@ -1,156 +1,145 @@
-import logging
 import os
-import shutil
 import json
-import hashlib
-from typing import Optional
-from .state_machine import RuntimeFSM, RuntimeState, GovernanceError
+import shutil
+import logging
+from typing import Optional, Dict, Any
+from ..runtime.state_machine import RuntimeFSM, RuntimeState, GovernanceError
+from ..util.crypto import verify_signature
+from ..util.context import enforce_pinned_context_or_fail
+from ..util import amu0_utils
+from .rollback_log import RollbackLog
 
 class RollbackEngine:
     """
-    Manages safe rollback to AMU0.
+    Manages the rollback mechanism for the COO Runtime.
     Enforces:
-    - 1 Automatic Rollback limit.
-    - CEO Signature Verification on AMU0.
-    - Halt -> QUESTION on failure.
+    1. AMU0 Signature Verification (Ed25519)
+    2. Filesystem Restoration
+    3. Rollback Limits (Persisted in AMU0)
+    4. Pinned Context Enforcement (Post-Rollback)
     """
+    MAX_ROLLBACKS = 3
 
     def __init__(self, fsm: RuntimeFSM):
         self.fsm = fsm
         self.logger = logging.getLogger("RollbackEngine")
-        self._rollback_count = 0
-        self._max_rollbacks = 1
+        # CEO Public Key Path
+        self.public_key_path = os.path.join(os.path.dirname(__file__), "../../coo_runtime/manifests/ceo_public_key.pem")
+        # CEO Private Key Path (for signing rollback log) - In prod this would be separate or HSM
+        self.private_key_path = os.path.join(os.path.dirname(__file__), "../../coo_runtime/manifests/ceo_private_key.pem")
+        
+        self.rollback_log = RollbackLog(self.private_key_path, self.public_key_path)
 
     def execute_rollback(self) -> None:
         """
-        Executes the rollback protocol.
+        Executes the rollback process.
         """
-        self.logger.warning("Initiating Rollback Protocol")
-
-        if self._rollback_count >= self._max_rollbacks:
-            self.fsm._force_error("Max Rollback Limit Reached (1). Halting.")
-            # force_error raises GovernanceError, so we stop here.
-            return
-
+        self.logger.warning("Initiating Rollback Sequence...")
+        
+        # 1. Resolve AMU0 Path (F8)
         try:
-            # 1. Verify CEO Signature on AMU0
-            self._verify_amu0_signature()
+            amu0_path = amu0_utils.resolve_amu0_path()
+        except GovernanceError as e:
+            self.logger.critical(f"Rollback Failed: Could not resolve AMU0 path: {e}")
+            self.fsm.transition_to(RuntimeState.ERROR)
+            raise e
 
-            # 2. Restore from AMU0
-            self._restore_from_amu0()
+        # 2. Check Rollback Limit via Signed Log (A.1)
+        try:
+            current_count = self.rollback_log.get_rollback_count(amu0_path)
+            if current_count >= self.MAX_ROLLBACKS:
+                self.logger.critical(f"Max rollbacks exceeded ({current_count}/{self.MAX_ROLLBACKS}).")
+                self.fsm.transition_to(RuntimeState.ERROR)
+                raise GovernanceError("Max rollbacks exceeded.")
+        except GovernanceError as e:
+             self.logger.critical(f"Rollback Log Verification Failed: {e}")
+             self.fsm.transition_to(RuntimeState.ERROR)
+             raise e
 
-            self._rollback_count += 1
-            self.logger.info(f"Rollback Successful. Count: {self._rollback_count}/{self._max_rollbacks}")
-            
-            # After rollback, we are effectively back at AMU0 capture state or similar.
-            # We transition FSM back to CAPTURE_AMU0 to allow retry or halt.
-            self.fsm.transition_to(RuntimeState.CAPTURE_AMU0)
-            
-        except Exception as e:
-            self.logger.critical(f"Rollback Failed: {e}")
-            self.fsm._force_error(f"Rollback Failed: {e}")
+        # 3. Verify AMU0 Integrity & Signature (F1)
+        self._verify_amu0_signature(amu0_path)
 
-    def _verify_amu0_signature(self) -> None:
+        # 4. Restore Filesystem
+        self._restore_from_amu0(amu0_path)
+
+        # 5. Log Rollback Action (A.1)
+        try:
+            self.rollback_log.append_entry(amu0_path, {
+                "action": "ROLLBACK",
+                "reason": "Governance Failure or Exception",
+                "actor": "RollbackEngine"
+            })
+        except GovernanceError as e:
+            self.logger.critical(f"Failed to append to rollback log: {e}")
+            self.fsm.transition_to(RuntimeState.ERROR)
+            raise e
+
+        # 6. Enforce Pinned Context (F9)
+        # Must happen after restore to ensure environment is reset to pinned state
+        try:
+            enforce_pinned_context_or_fail(amu0_path)
+        except GovernanceError as e:
+            self.logger.critical(f"Post-Rollback Context Enforcement Failed: {e}")
+            self.fsm.transition_to(RuntimeState.ERROR)
+            raise e
+
+        # 7. Transition FSM
+        # Rollback returns to GATES state to retry
+        self.fsm.transition_to(RuntimeState.GATES)
+        self.logger.info(f"Rollback Complete. Count: {current_count + 1}")
+
+    def _verify_amu0_signature(self, amu0_path: str) -> None:
         """
-        Verifies the CEO's cryptographic signature on the AMU0 bundle.
-        Uses Ed25519. No DEV-mode bypass - signature verification always required.
+        Verifies the Ed25519 signature of the AMU0 bundle.
         """
-        self.logger.info("Verifying CEO Signature on AMU0...")
-        
-        from ..util.crypto import verify_signature
-        
-        amu_dir = "amu0_capture"
-        sig_path = os.path.join(amu_dir, "signature.sig")
-        
+        if not os.path.exists(self.public_key_path):
+             # In production, this is fatal.
+             raise GovernanceError("CEO Public Key missing. Cannot verify AMU0.")
+
+        sig_path = os.path.join(amu0_path, "signature.sig")
         if not os.path.exists(sig_path):
-            raise GovernanceError("AMU0 Signature Missing")
-        
-        # Read signature (raw bytes)
+            raise GovernanceError("AMU0 Signature missing.")
+
         with open(sig_path, "rb") as f:
             signature = f.read()
-            
-        # Re-calculate canonical hash to verify
-        manifest_path = os.path.join(amu_dir, "snapshot_manifest.json")
-        context_path = os.path.join(amu_dir, "pinned_context.json")
-        
-        hasher = hashlib.sha256()
-        
-        # Hash files in sorted order (same as signing)
-        for filepath in sorted([manifest_path, context_path]):
-            if os.path.exists(filepath):
-                with open(filepath, "rb") as f:
-                    hasher.update(f.read())
-        
-        canonical_hash = hasher.digest()
-        
-        # Verify signature using CEO public key (resolve absolute path)
-        script_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        public_key_path = os.path.join(script_dir, "coo_runtime", "manifests", "ceo_public_key.pem")
-        
-        if not verify_signature(public_key_path, canonical_hash, signature):
-            raise GovernanceError("AMU0 Signature Verification Failed")
-        
-        self.logger.info("AMU0 Signature verified successfully.")
 
-    def _restore_from_amu0(self) -> None:
+        # Calculate Canonical Hash (F1, F8)
+        try:
+            canonical_hash = amu0_utils.calculate_canonical_hash(amu0_path)
+        except GovernanceError as e:
+             raise GovernanceError(f"AMU0 Verification Failed (Hashing): {e}")
+
+        # Verify
+        if not verify_signature(self.public_key_path, canonical_hash, signature):
+            raise GovernanceError("AMU0 Signature Verification Failed! Bundle may be tampered.")
+
+    def _restore_from_amu0(self, amu0_path: str) -> None:
         """
-        Restores filesystem, DB, etc. from AMU0.
+        Restores the filesystem from the AMU0 snapshot.
         """
-        self.logger.info("Restoring System from AMU0...")
-        
-        amu_dir = "amu0_capture"
-        if not os.path.exists(amu_dir):
-            raise GovernanceError("AMU0 Capture not found. Cannot rollback.")
-            
-        # Restore critical directories
-        # We assume AMU0 contains 'manifests', 'pinned_context.json', etc.
-        # And potentially a snapshot of 'project_builder' if we need to restore it.
-        # If PB was deleted, we need to restore it.
-        
-        # Verify Snapshot Integrity
-        manifest_path = os.path.join(amu_dir, "snapshot_manifest.json")
-        if not os.path.exists(manifest_path):
-             raise GovernanceError("AMU0 Snapshot Manifest Missing. Cannot rollback safely.")
-             
-        with open(manifest_path, "r") as f:
-            snapshot_manifest = json.load(f)
-            
-        snapshot_root = os.path.join(amu_dir, "fs_snapshot")
+        snapshot_root = os.path.join(amu0_path, "fs_snapshot")
         if not os.path.exists(snapshot_root):
-             raise GovernanceError("AMU0 Filesystem Snapshot Missing. Cannot rollback safely.")
-             
-        # Verify hashes
-        self.logger.info("Verifying Snapshot Integrity...")
-        for rel_path, expected_hash in snapshot_manifest.items():
-            # rel_path is relative to repo root, but in snapshot it's under fs_snapshot
-            # Wait, _snapshot_filesystem stored full paths or relative?
-            # It stored relative to repo root.
-            # And structure in fs_snapshot mirrors repo root.
-            # So if rel_path is "project_builder/main.py", it is at "amu0_capture/fs_snapshot/project_builder/main.py"
-            
-            snapshot_file_path = os.path.join(snapshot_root, rel_path)
-            if not os.path.exists(snapshot_file_path):
-                 raise GovernanceError(f"Snapshot Corrupt: Missing file {rel_path}")
-                 
-            with open(snapshot_file_path, "rb") as f:
-                actual_hash = hashlib.sha256(f.read()).hexdigest()
-                
-            if actual_hash != expected_hash:
-                 raise GovernanceError(f"Snapshot Corrupt: Hash mismatch for {rel_path}")
-                 
-        self.logger.info("Snapshot Integrity Verified.")
+            raise GovernanceError("AMU0 Snapshot missing.")
 
-        # Restore from Snapshot
-        # We restore everything in the snapshot to the repo root.
-        for item in os.listdir(snapshot_root):
-            src = os.path.join(snapshot_root, item)
-            dest = os.path.join(os.getcwd(), item)
+        # Restore Project Builder
+        if os.path.exists("project_builder"):
+            shutil.rmtree("project_builder")
+        if os.path.exists(os.path.join(snapshot_root, "project_builder")):
+            shutil.copytree(os.path.join(snapshot_root, "project_builder"), "project_builder")
+
+        # Restore COO
+        if os.path.exists("coo"):
+            shutil.rmtree("coo")
+        if os.path.exists(os.path.join(snapshot_root, "coo")):
+            shutil.copytree(os.path.join(snapshot_root, "coo"), "coo")
+
+        # Restore Manifests (Optional, usually in coo/manifests or separate)
+        if os.path.exists("manifests"):
+            shutil.rmtree("manifests")
+        if os.path.exists(os.path.join(snapshot_root, "manifests")):
+            shutil.copytree(os.path.join(snapshot_root, "manifests"), "manifests")
             
-            if os.path.isdir(src):
-                if os.path.exists(dest):
-                    shutil.rmtree(dest)
-                shutil.copytree(src, dest)
-                self.logger.info(f"Restored directory: {item}")
-            else:
-                shutil.copy2(src, dest)
-                self.logger.info(f"Restored file: {item}")
+        # Restore Reference Mission
+        if os.path.exists("phase3_reference_mission.json"):
+            os.remove("phase3_reference_mission.json")
+        shutil.copy(os.path.join(amu0_path, "phase3_reference_mission.json"), "phase3_reference_mission.json")

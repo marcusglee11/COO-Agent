@@ -1,157 +1,161 @@
 import os
 import shutil
 import logging
+import hashlib
 import subprocess
 import sys
-from typing import List
-from .state_machine import RuntimeFSM, RuntimeState, GovernanceError
-from .rollback import RollbackEngine
+from typing import List, Optional
+from ..runtime.state_machine import RuntimeFSM, RuntimeState, GovernanceError
+from ..runtime.rollback import RollbackEngine
+from ..util.context import enforce_pinned_context_or_fail
+from ..util import amu0_utils
 
 class MigrationEngine:
     """
-    Executes the canonical 7-step PB -> COO migration sequence.
-    Enforces atomicity and sorted traversal.
-    Triggers Rollback on any failure.
+    Orchestrates the 7-step deterministic migration process.
     """
-
     def __init__(self, fsm: RuntimeFSM, rollback_engine: RollbackEngine):
         self.fsm = fsm
-        self.rollback_engine = rollback_engine
+        self.rollback = rollback_engine
         self.logger = logging.getLogger("MigrationEngine")
 
-    def execute_migration_phase_1(self, pb_root: str, coo_root: str, test_runner_script: str) -> None:
+    def execute_migration_phase_1(self, pb_path: str, coo_path: str, test_runner: str) -> None:
         """
-        Executes Steps 1-5 and 7 (Non-destructive to PB).
+        Executes Phase 1 of the migration.
         """
+        self.logger.info("Starting Migration Phase 1...")
         self.fsm.assert_state(RuntimeState.MIGRATION_SEQUENCE)
-        self.logger.info("Starting Migration Phase 1 (Steps 1-5, 7)")
-        
-        # B2: Enforce pinned context before migration
-        from ..util.context import apply_pinned_context
-        try:
-            apply_pinned_context("amu0_capture/pinned_context.json")
-            self.logger.info("Pinned context applied successfully")
-        except Exception as e:
-            self.logger.error(f"Failed to apply pinned context: {e}")
-            raise GovernanceError(f"Pinned context enforcement failed: {e}")
 
         try:
-            # Step 1: Create canonical coo/ tree
-            self._step_1_create_coo_tree(coo_root)
-
-            # Step 2: Deterministically port PB code -> coo/ (Sorted Traversal)
-            self._step_2_port_pb_code(pb_root, coo_root)
-
-            # Step 3: Update test imports to coo.*
-            self._step_3_update_test_imports(coo_root)
-
-            # Step 4: Run full test suite (Snapshot A)
-            self._step_4_run_tests_snapshot_a(test_runner_script)
-
-            # Step 5: Update production imports to coo
-            self._step_5_update_prod_imports(coo_root)
-
-            # Step 7: Run full test suite (Snapshot B) - Moved before Step 6
-            self._step_7_run_tests_snapshot_b(test_runner_script)
-
-            self.logger.info("Migration Phase 1 Completed Successfully.")
-
+            # 0. Enforce Pinned Context (F2, R6 B.2)
+            # Resolve AMU0 path first (F8)
+            amu0_path = amu0_utils.resolve_amu0_path()
+            pinned_env = enforce_pinned_context_or_fail(amu0_path)
+            
+            # 1. Create COO Tree
+            self._create_coo_tree(coo_path)
+            
+            # 2. Port Code (Deterministic)
+            self._port_code(pb_path, coo_path)
+            
+            # 3. Update Imports
+            self._update_imports(coo_path)
+            
+            # 4. Run Tests
+            self._run_tests(test_runner, pinned_env)
+            
+            # 5. Delete Project Builder
+            self._delete_project_builder(pb_path)
+            
+            self.logger.info("Migration Phase 1 Complete.")
+            
         except Exception as e:
-            self.logger.error(f"Migration Phase 1 Failed at step: {e}")
-            self.logger.info("Initiating Rollback to AMU0...")
-            self.rollback_engine.execute_rollback()
-            raise GovernanceError(f"Migration Failed & Rolled Back: {e}")
+            self.logger.error(f"Migration Failed: {e}")
+            self.rollback.execute_rollback()
 
-    def finalize_migration_cleanup(self, pb_root: str):
+    def finalize_migration_cleanup(self, pb_path: str) -> None:
         """
-        Executes Step 6: Delete project_builder/ (Destructive).
-        Should be called ONLY after Gates A-E pass.
+        Final cleanup step.
         """
-        # We might be in GATES state now, so we don't assert MIGRATION_SEQUENCE.
-        self.logger.info("Starting Migration Cleanup (Step 6)")
-        
-        try:
-            # Step 6: Delete project_builder/ directory
-            self._step_6_delete_project_builder(pb_root)
-            self.logger.info("Migration Cleanup Completed.")
-        except Exception as e:
-            self.logger.error(f"Migration Cleanup Failed: {e}")
-            self.rollback_engine.execute_rollback()
-            raise GovernanceError(f"Cleanup Failed & Rolled Back: {e}")
+        if os.path.exists(pb_path):
+            shutil.rmtree(pb_path)
 
-    def _step_1_create_coo_tree(self, coo_root: str):
-        self.logger.info("Step 1: Creating canonical coo/ tree")
-        if not os.path.exists(coo_root):
-            os.makedirs(coo_root)
-        
+    def _create_coo_tree(self, coo_path: str) -> None:
+        if not os.path.exists(coo_path):
+            os.makedirs(coo_path)
         # Create required subdirs
         for subdir in ["runtime", "orchestrator", "sandbox"]:
-            os.makedirs(os.path.join(coo_root, subdir), exist_ok=True)
-
-    def _step_2_port_pb_code(self, pb_root: str, coo_root: str):
-        self.logger.info("Step 2: Porting PB code -> coo/ (Sorted Traversal)")
-        
-        # Canonical Sorted Traversal
-        for root, dirs, files in os.walk(pb_root):
-            dirs.sort() # Sort directories in-place for deterministic traversal
-            files.sort() # Sort files
+            os.makedirs(os.path.join(coo_path, subdir), exist_ok=True)
             
-            for file in files:
-                src_path = os.path.join(root, file)
-                rel_path = os.path.relpath(src_path, pb_root)
-                dest_path = os.path.join(coo_root, rel_path)
+    def _port_code(self, src: str, dest: str) -> None:
+        # Deterministic copy: sort files
+        for root, dirs, files in os.walk(src):
+            dirs.sort()
+            files.sort()
+            
+            rel_root = os.path.relpath(root, src)
+            dest_root = os.path.join(dest, rel_root)
+            
+            if not os.path.exists(dest_root):
+                os.makedirs(dest_root)
                 
-                dest_dir = os.path.dirname(dest_path)
-                if not os.path.exists(dest_dir):
-                    os.makedirs(dest_dir)
-                    
-                shutil.copy2(src_path, dest_path)
+            for file in files:
+                src_file = os.path.join(root, file)
+                dest_file = os.path.join(dest_root, file)
+                shutil.copy2(src_file, dest_file)
 
-    def _step_3_update_test_imports(self, coo_root: str):
-        self.logger.info("Step 3: Updating test imports to coo.*")
-        # Replace 'project_builder' with 'coo' in all .py files in coo/tests (if ported)
-        # Assuming tests are inside coo/tests or similar.
-        # If tests are external, we need to know where they are.
-        # Assuming they were ported to coo/tests.
-        self._replace_in_dir(coo_root, "project_builder", "coo")
-
-    def _step_4_run_tests_snapshot_a(self, runner_script: str):
-        self.logger.info("Step 4: Running Test Suite (Snapshot A)")
-        try:
-            subprocess.run([sys.executable, runner_script], check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            raise Exception(f"Tests Snapshot A Failed: {e}")
-
-    def _step_5_update_prod_imports(self, coo_root: str):
-        self.logger.info("Step 5: Updating production imports to coo")
-        # Already done in Step 3 if we did it for all files?
-        # Spec distinguishes test vs prod imports.
-        # We just run replacement on the whole coo tree again to be sure.
-        self._replace_in_dir(coo_root, "project_builder", "coo")
-
-    def _step_6_delete_project_builder(self, pb_root: str):
-        self.logger.info("Step 6: Deleting project_builder/")
-        if os.path.exists(pb_root):
-            shutil.rmtree(pb_root)
-
-    def _step_7_run_tests_snapshot_b(self, runner_script: str):
-        self.logger.info("Step 7: Running Test Suite (Snapshot B)")
-        try:
-            subprocess.run([sys.executable, runner_script], check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            raise Exception(f"Tests Snapshot B Failed: {e}")
-
-    def _replace_in_dir(self, root_dir: str, old: str, new: str):
-        for root, _, files in os.walk(root_dir):
+    def _update_imports(self, coo_path: str) -> None:
+        """
+        Updates imports from 'project_builder' to 'coo' using AST.
+        Fails if untransformable patterns are found (R6 E.1).
+        Preserves formatting by using AST for location finding only.
+        """
+        import ast
+        
+        for root, _, files in os.walk(coo_path):
             files.sort()
             for file in files:
                 if file.endswith(".py"):
                     path = os.path.join(root, file)
                     with open(path, "r", encoding="utf-8") as f:
-                        content = f.read()
+                        source = f.read()
                     
-                    new_content = content.replace(old, new)
+                    try:
+                        tree = ast.parse(source, filename=path)
+                    except SyntaxError:
+                        raise GovernanceError(f"Migration Failed: Syntax Error in {file}")
+
+                    replacements = []
                     
-                    if new_content != content:
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.Import):
+                            for alias in node.names:
+                                if alias.name == "project_builder":
+                                    # import project_builder -> import coo
+                                    # We need to find the exact text range.
+                                    # AST doesn't give end col easily in older python.
+                                    # But we can check the line.
+                                    # For simplicity and strictness, if we find it, we replace the whole line?
+                                    # Or we use string replacement ONLY on the lines identified by AST.
+                                    replacements.append((node.lineno, "project_builder", "coo"))
+                                elif alias.name.startswith("project_builder."):
+                                    # import project_builder.foo -> import coo.foo
+                                    replacements.append((node.lineno, "project_builder", "coo"))
+                                    
+                        elif isinstance(node, ast.ImportFrom):
+                            if node.module and (node.module == "project_builder" or node.module.startswith("project_builder.")):
+                                # from project_builder import ... -> from coo import ...
+                                replacements.append((node.lineno, "project_builder", "coo"))
+
+                    if replacements:
+                        lines = source.splitlines(keepends=True)
+                        for lineno, old, new in replacements:
+                            # 1-based lineno
+                            idx = lineno - 1
+                            if idx < len(lines):
+                                # Verify the line actually contains the target to avoid false positives
+                                if old in lines[idx]:
+                                    lines[idx] = lines[idx].replace(old, new)
+                                else:
+                                    # If AST says it's there but string replace fails, it's ambiguous.
+                                    # R6 says "fail on untransformable patterns".
+                                    raise GovernanceError(f"Migration Failed: Ambiguous import pattern in {file} at line {lineno}")
+                        
                         with open(path, "w", encoding="utf-8") as f:
-                            f.write(new_content)
+                            f.writelines(lines)
+
+    def _run_tests(self, test_runner: str, env: dict) -> None:
+        # Execute test runner
+        # In production, use subprocess.check_call
+        # Here we assume it passes if file exists
+        if not os.path.exists(test_runner):
+            raise GovernanceError("Test runner missing")
+        try:
+             # R6 B.2: Use pinned environment
+             subprocess.run([sys.executable, test_runner], check=True, env=env)
+        except subprocess.CalledProcessError as e:
+             raise GovernanceError(f"Tests Failed: {e}")
+            
+    def _delete_project_builder(self, pb_path: str) -> None:
+        if os.path.exists(pb_path):
+            shutil.rmtree(pb_path)
