@@ -5,8 +5,25 @@ Provides canonical path resolution and recursive hashing for AMU0 bundles.
 import os
 import hashlib
 import json
+from dataclasses import dataclass
 from ..runtime.state_machine import GovernanceError
 from ..util.crypto import verify_signature
+
+# ============================================================================
+# A4: VerificationResult Type - R6.3
+# ============================================================================
+
+@dataclass
+class VerificationResult:
+    """
+    Result of AMU0 verification.
+    
+    R6.3 A4: Typed object with fail-closed semantics.
+    Function returns this ONLY on success, raises GovernanceError on ANY failure.
+    """
+    canonical_hash: bytes        # The canonical AMU0 hash
+    amu0_id: str                 # Derived from canonical_hash (first 16 hex chars)
+    has_rollback_log: bool       # Whether rollback log was present & verified
 
 def resolve_amu0_path() -> str:
     """
