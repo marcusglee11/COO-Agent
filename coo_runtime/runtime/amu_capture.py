@@ -3,12 +3,13 @@ import json
 import uuid
 import shutil
 import logging
-import subprocess
 import hashlib
 from typing import Optional, Dict, Any
 from ..runtime.state_machine import GovernanceError
-from ..util.crypto import sign_bytes
+from ..util.crypto import Signature, get_ceo_private_key_path, create_signature_metadata
 from ..util import amu0_utils
+from ..util.context import capture_hardware_context
+from ..util.subprocess import run_pinned_subprocess
 
 class AMUCapture:
     """
@@ -20,8 +21,8 @@ class AMUCapture:
     """
     def __init__(self):
         self.logger = logging.getLogger("AMUCapture")
-        # CEO Private Key Path (Simulated secure storage)
-        self.private_key_path = os.path.join(os.path.dirname(__file__), "../../coo_runtime/manifests/ceo_private_key.pem")
+        # R6.3: Key paths from environment variables only (D1)
+        # No repository paths, no fallbacks
 
     def capture_amu0(self, manifests_dir: str, mission_path: str) -> str:
         """
@@ -62,7 +63,8 @@ class AMUCapture:
             except GovernanceError as e:
                 raise GovernanceError(f"AMU0 Hashing Failed: {e}")
                 
-            amu0_id = canonical_hash.hex()[:16] # Use first 16 chars of hash for ID
+            # R6.3 A3: Derive ID from hash (no amu0_id.txt file)
+            amu0_id = amu0_utils.derive_amu0_id(canonical_hash)
             
             # 6. Rename to Final AMU0 Directory
             amu_dir_name = f"amu0_{amu0_id}"
@@ -75,44 +77,48 @@ class AMUCapture:
             os.rename(temp_dir, amu_dir)
             self.logger.info(f"Created AMU0 directory: {amu_dir}")
             
-            # 7. Write AMU0 ID to file
-            with open(os.path.join(amu_dir, "amu0_id.txt"), "w") as f:
-                f.write(amu0_id)
+            # 7. R6.3 A3: NO amu0_id.txt file - ID is derived from hash only
+            # (removed file creation)
                 
             # 8. Persist Active AMU0 Path (A.1 - Signed Tracker)
-            # Get current git commit
+            # Get current git commit using pinned subprocess
             try:
-                repo_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-            except subprocess.CalledProcessError:
-                repo_commit = "UNKNOWN_COMMIT" # Should fail in strict mode? R6 implies strictness.
-                # But if not a git repo (e.g. docker build), maybe allow?
-                # "repo_commit: <git SHA>" implies it must be there.
-                # Let's assume git is available or fail.
-                self.logger.warning("Could not determine git commit. Using placeholder.")
+                result = run_pinned_subprocess(
+                    ["git", "rev-parse", "HEAD"],
+                    amu_dir,
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                repo_commit = result.stdout.strip()
+            except Exception as e:
+                raise GovernanceError(f"Cannot determine git commit: {e}")
 
             # Use pinned timestamp if available, else current time (but R6 says pinned time)
             # We have pinned_context['mock_time'] from manifest or generated.
             # Let's use the timestamp we put in snapshot_manifest.
             created_at = snapshot_manifest["timestamp"]
 
+            # R6.3 Supplemental: Add mode to tracker
+            mode = os.environ.get("COO_MODE", "dev")
+            
             tracker_payload = {
                 "amu0_id": amu0_id,
                 "amu0_path": amu_dir_name,
                 "created_at": created_at,
-                "repo_commit": repo_commit
+                "repo_commit": repo_commit,
+                "mode": mode  # R6.3 Supplemental: dev/prod separation
             }
             
-            # Sign the payload
+            # Sign the payload (R6.3 D2: Unified Signature Protocol)
             tracker_bytes = json.dumps(tracker_payload, sort_keys=True).encode("utf-8")
             
-            if not os.path.exists(self.private_key_path):
-                 # Try env var
-                 private_key_path = os.environ.get("CEO_PRIVATE_KEY_PATH")
-                 if not private_key_path:
-                      raise GovernanceError("CEO Private Key missing (Env Var CEO_PRIVATE_KEY_PATH not set). Cannot sign active AMU0 tracker.")
-                 self.private_key_path = private_key_path
+            try:
+                private_key_path = get_ceo_private_key_path()
+            except Exception as e:
+                raise GovernanceError(f"Cannot get CEO private key: {e}")
 
-            tracker_sig = sign_bytes(self.private_key_path, tracker_bytes)
+            tracker_sig = Signature.sign_data(tracker_bytes, private_key_path)
             
             # Write Tracker JSON
             with open("active_amu0_path.json", "w") as f:
@@ -250,12 +256,18 @@ class AMUCapture:
              # A.3: Fail on wrong type
              raise GovernanceError("environment_manifest.json: allowed_env_vars must be a list")
             
+        # R6.3 B1: Capture REAL hardware context (no placeholders)
+        try:
+            hw_context = capture_hardware_context()
+        except Exception as e:
+            raise GovernanceError(f"Hardware capture failed during AMU0 snapshot: {e}")
+        
         pinned_context = {
             "rng_seed": env_data.get("rng_seed", "DETERMINISTIC_SEED_DEFAULT"),
             "env_vars": captured_env,
             "mock_time": env_data.get("mock_time"),
-            "kernel_version": "UNKNOWN", # Should be captured from system (WS-B will fix this)
-            "cpu_microcode": "UNKNOWN"
+            "kernel_version": hw_context["kernel_version"],  # R6.3 B1: Real capture
+            "cpu_microcode": hw_context["cpu_microcode"]      # R6.3 B1: Real capture
         }
         
         with open(os.path.join(amu_dir, "pinned_context.json"), "w") as f:
