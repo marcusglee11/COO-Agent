@@ -1,0 +1,922 @@
+import os
+import json
+import logging
+import hashlib
+import shutil
+import time
+from typing import Dict, Any
+from .state_machine import GovernanceError
+
+class AMUCapture:
+    """
+    Captures the Authoritative Migration Unit (AMU0).
+    AMU0 is the authoritative pre-migration snapshot.
+    Includes:
+    - Full filesystem snapshot
+    - DB dump
+    - Sandbox digest
+    - Pinned Context (RNG, Time, CPU, Env, PID, FDs)
+    - Reference Mission (SHA-locked)
+    """
+
+    def __init__(self):
+        self.logger = logging.getLogger("AMUCapture")
+
+    def capture_amu0(self, manifests_dir: str, reference_mission_path: str) -> str:
+        """
+        Captures all required context and bundles it into AMU0.
+        Returns the path to the AMU0 bundle (directory or zip).
+        """
+        self.logger.info("Capturing AMU0...")
+
+        amu_dir = "amu0_capture" # In real impl, use a timestamped or unique dir
+        if os.path.exists(amu_dir):
+            shutil.rmtree(amu_dir)
+        os.makedirs(amu_dir)
+
+        # 1. Capture Pinned Context
+        context = self._capture_pinned_context(manifests_dir)
+        with open(os.path.join(amu_dir, "pinned_context.json"), "w") as f:
+            json.dump(context, f, indent=2)
+
+        # 2. Capture Reference Mission (SHA-locked)
+        if not os.path.exists(reference_mission_path):
+            raise GovernanceError(f"Reference Mission missing: {reference_mission_path}")
+        
+        shutil.copy(reference_mission_path, os.path.join(amu_dir, "phase3_reference_mission.json"))
+        
+        with open(reference_mission_path, "rb") as f:
+            ref_hash = hashlib.sha256(f.read()).hexdigest()
+        
+        # Verify hash against something? Spec says "SHA256-locked and CEO-signed".
+        # We record the hash in the manifest.
+        
+        # 3. Capture Manifests
+        shutil.copytree(manifests_dir, os.path.join(amu_dir, "manifests"))
+
+        # 4. Capture Filesystem Snapshot
+        self._snapshot_filesystem(amu_dir)
+
+        # 5. Capture DB Dump (Mocked)
+        # self._dump_database(amu_dir)
+        
+        # 6. Sign AMU0
+        self._sign_amu0(amu_dir)
+
+        self.logger.info(f"AMU0 Captured at {amu_dir}")
+        return amu_dir
+
+    def _snapshot_filesystem(self, amu_dir: str) -> None:
+        """
+        Snapshots critical directories (PB, COO, Manifests) and generates a hash manifest.
+        """
+        self.logger.info("Snapshotting filesystem...")
+        snapshot_root = os.path.join(amu_dir, "fs_snapshot")
+        os.makedirs(snapshot_root)
+        
+        targets = ["project_builder", "coo", "manifests"]
+        file_hashes = {}
+        
+        for target in targets:
+            if os.path.exists(target):
+                dest = os.path.join(snapshot_root, target)
+                if os.path.isdir(target):
+                    shutil.copytree(target, dest)
+                    # Hash all files
+                    for root, _, files in os.walk(target):
+                        for file in files:
+                            path = os.path.join(root, file)
+                            rel_path = os.path.relpath(path, os.getcwd()) # Relative to CWD (repo root)
+                            with open(path, "rb") as f:
+                                file_hashes[rel_path] = hashlib.sha256(f.read()).hexdigest()
+                else:
+                    shutil.copy2(target, dest)
+                    with open(target, "rb") as f:
+                        file_hashes[target] = hashlib.sha256(f.read()).hexdigest()
+            else:
+                self.logger.warning(f"Snapshot target missing: {target}")
+
+        # Write snapshot manifest
+        with open(os.path.join(amu_dir, "snapshot_manifest.json"), "w") as f:
+            json.dump(file_hashes, f, indent=2, sort_keys=True)
+
+    def _sign_amu0(self, amu_dir: str) -> None:
+        """
+        Signs the AMU0 bundle.
+        In DEV mode, uses a test key.
+        In STRICT mode, would require a real key (mocked here for now).
+        """
+        self.logger.info("Signing AMU0...")
+        
+        # Calculate hash of the entire AMU0 content (excluding signature)
+        # For simplicity, we just hash the snapshot manifest and pinned context
+        manifest_path = os.path.join(amu_dir, "snapshot_manifest.json")
+        context_path = os.path.join(amu_dir, "pinned_context.json")
+        
+        hasher = hashlib.sha256()
+        if os.path.exists(manifest_path):
+            with open(manifest_path, "rb") as f:
+                hasher.update(f.read())
+        if os.path.exists(context_path):
+            with open(context_path, "rb") as f:
+                hasher.update(f.read())
+                
+        digest = hasher.hexdigest()
+        
+        # Sign digest
+        # MOCK SIGNATURE
+        signature = f"SIG_{digest}_CEO_KEY"
+        
+        with open(os.path.join(amu_dir, "signature.sig"), "w") as f:
+            f.write(signature)
+
+    def _capture_pinned_context(self, manifests_dir: str) -> Dict[str, Any]:
+        """
+        Captures the exact environment state, verified against manifests.
+        """
+        # Load manifests
+        env_manifest_path = os.path.join(manifests_dir, "environment_manifest.json")
+        hw_manifest_path = os.path.join(manifests_dir, "hardware_manifest.json")
+        
+        if not os.path.exists(env_manifest_path) or not os.path.exists(hw_manifest_path):
+             raise GovernanceError("Missing manifests for AMU capture.")
+             
+        with open(env_manifest_path, "r") as f:
+            env_manifest = json.load(f)
+        with open(hw_manifest_path, "r") as f:
+            hw_manifest = json.load(f)
+            
+        # Verify Live Environment against Manifest
+        # Check allowed env vars
+        allowed_vars = env_manifest.get("allowed_env_vars", [])
+        current_env = {}
+        for k, v in os.environ.items():
+            if k in allowed_vars:
+                current_env[k] = v
+            # In strict mode, we might fail if extra vars are present, but for now we just capture allowed ones.
+            
+        # Capture Hardware Info (from manifest, as we can't change hardware easily)
+        # But we should verify if possible. For now, we trust the manifest as the "pinned" truth.
+        
+        context = {
+            "rng_seed": env_manifest.get("rng_seed", "DETERMINISTIC_SEED_DEFAULT"),
+            "mock_time": env_manifest.get("mock_time", "2025-01-01T00:00:00Z"),
+            "cpu_microcode": hw_manifest.get("cpu_microcode", "UNKNOWN"),
+            "numa_topology": hw_manifest.get("numa_topology", "UNKNOWN"),
+            "kernel_version": hw_manifest.get("kernel_version", "UNKNOWN"),
+            "env_vars": current_env,
+            "pid": os.getpid(),
+            "open_fds": 3 # Enforced by freeze
+        }
+        
+        return context
+  
+=== ROLLBACK.PY ===  
+import logging
+import os
+import shutil
+import json
+import hashlib
+from typing import Optional
+from .state_machine import RuntimeFSM, RuntimeState, GovernanceError
+
+class RollbackEngine:
+    """
+    Manages safe rollback to AMU0.
+    Enforces:
+    - 1 Automatic Rollback limit.
+    - CEO Signature Verification on AMU0.
+    - Halt -> QUESTION on failure.
+    """
+
+    def __init__(self, fsm: RuntimeFSM):
+        self.fsm = fsm
+        self.logger = logging.getLogger("RollbackEngine")
+        self._rollback_count = 0
+        self._max_rollbacks = 1
+
+    def execute_rollback(self) -> None:
+        """
+        Executes the rollback protocol.
+        """
+        self.logger.warning("Initiating Rollback Protocol")
+
+        if self._rollback_count >= self._max_rollbacks:
+            self.fsm._force_error("Max Rollback Limit Reached (1). Halting.")
+            # force_error raises GovernanceError, so we stop here.
+            return
+
+        try:
+            # 1. Verify CEO Signature on AMU0
+            self._verify_amu0_signature()
+
+            # 2. Restore from AMU0
+            self._restore_from_amu0()
+
+            self._rollback_count += 1
+            self.logger.info(f"Rollback Successful. Count: {self._rollback_count}/{self._max_rollbacks}")
+            
+            # After rollback, we are effectively back at AMU0 capture state or similar.
+            # We transition FSM back to CAPTURE_AMU0 to allow retry or halt.
+            self.fsm.transition_to(RuntimeState.CAPTURE_AMU0)
+            
+        except Exception as e:
+            self.logger.critical(f"Rollback Failed: {e}")
+            self.fsm._force_error(f"Rollback Failed: {e}")
+
+    def _verify_amu0_signature(self) -> None:
+        """
+        Verifies the CEO's cryptographic signature on the AMU0 bundle.
+        """
+        self.logger.info("Verifying CEO Signature on AMU0...")
+        
+        amu_dir = "amu0_capture"
+        sig_path = os.path.join(amu_dir, "signature.sig")
+        
+        if not os.path.exists(sig_path):
+             raise GovernanceError("AMU0 Signature Missing")
+
+        # Check mode
+        strict_mode = os.environ.get("COO_STRICT_MODE", "0") == "1"
+        
+        # Read signature
+        with open(sig_path, "r") as f:
+            signature = f.read().strip()
+            
+        # Re-calculate hash to verify (Mock verification)
+        manifest_path = os.path.join(amu_dir, "snapshot_manifest.json")
+        context_path = os.path.join(amu_dir, "pinned_context.json")
+        
+        hasher = hashlib.sha256()
+        if os.path.exists(manifest_path):
+            with open(manifest_path, "rb") as f:
+                hasher.update(f.read())
+        if os.path.exists(context_path):
+            with open(context_path, "rb") as f:
+                hasher.update(f.read())
+        digest = hasher.hexdigest()
+        expected_sig = f"SIG_{digest}_CEO_KEY"
+        
+        if strict_mode:
+            # In STRICT mode, we enforce the signature match.
+            if signature != expected_sig:
+                raise GovernanceError("AMU0 Signature Verification Failed (STRICT MODE)")
+            self.logger.info("STRICT MODE: Signature verified.")
+        else:
+            # In DEV mode, we allow a test key or just presence.
+            if signature != expected_sig:
+                self.logger.warning("DEV MODE: Signature mismatch (ignoring).")
+            else:
+                self.logger.info("DEV MODE: Signature verified.")
+
+    def _restore_from_amu0(self) -> None:
+        """
+        Restores filesystem, DB, etc. from AMU0.
+        """
+        self.logger.info("Restoring System from AMU0...")
+        
+        amu_dir = "amu0_capture"
+        if not os.path.exists(amu_dir):
+            raise GovernanceError("AMU0 Capture not found. Cannot rollback.")
+            
+        # Restore critical directories
+        # We assume AMU0 contains 'manifests', 'pinned_context.json', etc.
+        # And potentially a snapshot of 'project_builder' if we need to restore it.
+        # If PB was deleted, we need to restore it.
+        
+        # Verify Snapshot Integrity
+        manifest_path = os.path.join(amu_dir, "snapshot_manifest.json")
+        if not os.path.exists(manifest_path):
+             raise GovernanceError("AMU0 Snapshot Manifest Missing. Cannot rollback safely.")
+             
+        with open(manifest_path, "r") as f:
+            snapshot_manifest = json.load(f)
+            
+        snapshot_root = os.path.join(amu_dir, "fs_snapshot")
+        if not os.path.exists(snapshot_root):
+             raise GovernanceError("AMU0 Filesystem Snapshot Missing. Cannot rollback safely.")
+             
+        # Verify hashes
+        self.logger.info("Verifying Snapshot Integrity...")
+        for rel_path, expected_hash in snapshot_manifest.items():
+            # rel_path is relative to repo root, but in snapshot it's under fs_snapshot
+            # Wait, _snapshot_filesystem stored full paths or relative?
+            # It stored relative to repo root.
+            # And structure in fs_snapshot mirrors repo root.
+            # So if rel_path is "project_builder/main.py", it is at "amu0_capture/fs_snapshot/project_builder/main.py"
+            
+            snapshot_file_path = os.path.join(snapshot_root, rel_path)
+            if not os.path.exists(snapshot_file_path):
+                 raise GovernanceError(f"Snapshot Corrupt: Missing file {rel_path}")
+                 
+            with open(snapshot_file_path, "rb") as f:
+                actual_hash = hashlib.sha256(f.read()).hexdigest()
+                
+            if actual_hash != expected_hash:
+                 raise GovernanceError(f"Snapshot Corrupt: Hash mismatch for {rel_path}")
+                 
+        self.logger.info("Snapshot Integrity Verified.")
+
+        # Restore from Snapshot
+        # We restore everything in the snapshot to the repo root.
+        for item in os.listdir(snapshot_root):
+            src = os.path.join(snapshot_root, item)
+            dest = os.path.join(os.getcwd(), item)
+            
+            if os.path.isdir(src):
+                if os.path.exists(dest):
+                    shutil.rmtree(dest)
+                shutil.copytree(src, dest)
+                self.logger.info(f"Restored directory: {item}")
+            else:
+                shutil.copy2(src, dest)
+                self.logger.info(f"Restored file: {item}")
+  
+=== REPLAY.PY ===  
+import logging
+import os
+import hashlib
+import filecmp
+import shutil
+import json
+import uuid
+from .state_machine import RuntimeFSM, RuntimeState, GovernanceError
+
+class ReplayEngine:
+    """
+    Executes Deterministic Replay (Gate F).
+    1. Verifies Reference Mission SHA against AMU0.
+    2. Runs mission twice in locked context.
+    3. Compares outputs byte-for-byte.
+    """
+
+    def __init__(self, fsm: RuntimeFSM):
+        self.fsm = fsm
+        self.logger = logging.getLogger("ReplayEngine")
+
+    def execute_replay(self, mission_path: str, amu0_path: str) -> None:
+        """
+        Executes the replay sequence.
+        """
+        self.fsm.assert_state(RuntimeState.GATES)
+        self.logger.info("Starting Deterministic Replay (Gate F)")
+
+        # 1. Verify Reference Mission SHA
+        self._verify_reference_mission(mission_path, amu0_path)
+
+        # 2. Run 1
+        self.logger.info("Replay Run 1...")
+        output1 = self._run_mission(mission_path, "run1")
+
+        # 3. Run 2
+        self.logger.info("Replay Run 2...")
+        output2 = self._run_mission(mission_path, "run2")
+
+        # 4. Compare
+        self.logger.info("Comparing Outputs...")
+        if not self._compare_outputs(output1, output2):
+             raise GovernanceError("Deterministic Replay Failed: Outputs do not match byte-for-byte.")
+
+        self.logger.info("Deterministic Replay Passed.")
+
+    def _verify_reference_mission(self, mission_path: str, amu0_path: str) -> None:
+        """
+        Verifies that the mission being replayed matches the one locked in AMU0.
+        """
+        # Calculate SHA of current mission
+        with open(mission_path, "rb") as f:
+            current_sha = hashlib.sha256(f.read()).hexdigest()
+            
+        # Get SHA from AMU0 manifest or file
+        # For now, we assume we compare against the file in AMU0
+        amu_mission_path = os.path.join(amu0_path, "phase3_reference_mission.json")
+        if not os.path.exists(amu_mission_path):
+            raise GovernanceError("AMU0 missing reference mission copy")
+            
+        with open(amu_mission_path, "rb") as f:
+            amu_sha = hashlib.sha256(f.read()).hexdigest()
+            
+        if current_sha != amu_sha:
+            raise GovernanceError("Replay Mission Mismatch: SHA256 does not match AMU0 locked version.")
+
+    def _run_mission(self, mission_path: str, run_id: str) -> str:
+        """
+        Runs the mission using the Real Orchestrator in a locked context.
+        Returns path to output directory containing DB dump and artifacts.
+        """
+        output_dir = f"replay_output_{run_id}"
+        if os.path.exists(output_dir):
+            shutil.rmtree(output_dir)
+        os.makedirs(output_dir)
+
+        # R3: Real Orchestrator Integration
+        # We need to mock the environment for the Orchestrator to be deterministic.
+        # 1. Mock MessageStore (SQLite DB)
+        db_path = os.path.join(output_dir, "mission.db")
+        
+        # We can't easily import Orchestrator here without setting up the whole path/env.
+        # Assuming we can import it if we are in the repo.
+        try:
+            from coo.orchestrator import Orchestrator
+            from coo.message_store import MessageStore
+            from coo.llm import ModelClient
+        except ImportError:
+             raise GovernanceError("Orchestrator imports failed. Cannot run Replay.")
+
+        # Mock Config
+        config = {
+            "agents": {
+                "COO": {"model": "mock-model"},
+                "Engineer": {"model": "mock-model"},
+                "QA": {"model": "mock-model"},
+            },
+            "sandbox": {"enabled": False}, # Disable real sandbox for replay? Or use deterministic mock?
+            # If we use real sandbox, we need docker.
+            # R3 requirement: "Replace the simulated harness with a call into the actual orchestrator"
+            # "under pinned context".
+            # For now, we'll assume we can run it.
+        }
+        
+        # Mock Model Client (Deterministic)
+        class MockModelClient(ModelClient):
+            def __init__(self, config):
+                pass
+            async def generate(self, prompt, **kwargs):
+                import hashlib
+                # Deterministic response based on prompt hash
+                h = hashlib.sha256(prompt.encode()).hexdigest()
+                return f"MOCK_RESPONSE_{h[:8]}"
+                
+        # We need to monkeypatch ModelClient or inject it.
+        # Orchestrator instantiates ModelClient in __init__.
+        # We can subclass Orchestrator or monkeypatch.
+        
+        # Monkeypatching for this run
+        import coo.orchestrator
+        original_client_cls = coo.orchestrator.ModelClient
+        coo.orchestrator.ModelClient = MockModelClient
+        
+        # Mock UUID for determinism
+        original_uuid4 = uuid.uuid4
+        self._uuid_counter = 0
+        def mock_uuid4():
+            self._uuid_counter += 1
+            # Generate deterministic UUID based on counter
+            h = hashlib.md5(str(self._uuid_counter).encode()).hexdigest()
+            return uuid.UUID(hex=h)
+            
+        uuid.uuid4 = mock_uuid4
+        
+        try:
+            # Initialize Store
+            import asyncio
+            
+            async def run_orchestrator():
+                store = MessageStore(db_path)
+                await store.initialize()
+                
+                orch = Orchestrator(store, config)
+                
+                # Inject Mission
+                with open(mission_path, "r") as f:
+                    mission_data = json.load(f)
+                    
+                mission_id = str(uuid.uuid4()) # Deterministic UUID
+                # We should use a fixed UUID for replay to be deterministic!
+                mission_id = "00000000-0000-0000-0000-000000000001"
+                
+                await store.create_mission({
+                    "id": mission_id, 
+                    "description": mission_data.get("mission", "Default Mission")
+                })
+                
+                # Run for a fixed number of ticks or until completion
+                # For this proof of concept, we run for 5 ticks
+                orch.running = True
+                for _ in range(5):
+                    await orch.tick()
+                    
+                orch.running = False
+                
+            # Run Async
+            asyncio.run(run_orchestrator())
+            
+        finally:
+            # Restore monkeypatch
+            coo.orchestrator.ModelClient = original_client_cls
+            uuid.uuid4 = original_uuid4
+
+        return output_dir
+
+    def _compare_outputs(self, out1: str, out2: str) -> bool:
+        """
+        Compares DB and artifacts.
+        For DB, performs semantic comparison ignoring timestamps.
+        """
+        import sqlite3
+        
+        # Compare DBs
+        db1_path = os.path.join(out1, "mission.db")
+        db2_path = os.path.join(out2, "mission.db")
+        
+        if not os.path.exists(db1_path) or not os.path.exists(db2_path):
+            self.logger.error("DB file missing in output")
+            return False
+            
+        try:
+            conn1 = sqlite3.connect(db1_path)
+            conn2 = sqlite3.connect(db2_path)
+            
+            tables = ["missions", "messages", "artifacts", "timeline_events"]
+            
+            for table in tables:
+                # Get columns
+                cursor = conn1.execute(f"PRAGMA table_info({table})")
+                columns = [row[1] for row in cursor.fetchall()]
+                
+                # Filter out timestamp columns
+                ignored_cols = {"created_at", "updated_at", "processed_at", "locked_at", "timeout_at", "completed_at", "failed_at", "started_at", "last_active"}
+                cols_to_compare = [c for c in columns if c not in ignored_cols]
+                
+                if not cols_to_compare:
+                    continue
+                    
+                query = f"SELECT {', '.join(cols_to_compare)} FROM {table} ORDER BY id"
+                
+                rows1 = conn1.execute(query).fetchall()
+                rows2 = conn2.execute(query).fetchall()
+                
+                if rows1 != rows2:
+                    self.logger.error(f"DB Mismatch in table {table}")
+                    self.logger.error(f"Rows1: {rows1}")
+                    self.logger.error(f"Rows2: {rows2}")
+                    return False
+                    
+        except Exception as e:
+            self.logger.error(f"DB Comparison Error: {e}")
+            return False
+        finally:
+            if 'conn1' in locals(): conn1.close()
+            if 'conn2' in locals(): conn2.close()
+            
+        return True
+  
+=== STATE_MACHINE.PY ===  
+from enum import Enum, auto
+from typing import Optional, List, Dict, Any
+import os
+
+class RuntimeState(Enum):
+    """
+    Canonical FSM States for COO Runtime v1.0.
+    Strictly defined in COO_RUNTIME_SPECIFICATION_v1.0.md.
+    """
+    INIT = auto()
+    AMENDMENT_PREP = auto()
+    AMENDMENT_EXEC = auto()
+    AMENDMENT_VERIFY = auto()
+    CEO_REVIEW = auto()
+    FREEZE_PREP = auto()
+    FREEZE_ACTIVATED = auto()
+    CAPTURE_AMU0 = auto()
+    MIGRATION_SEQUENCE = auto()
+    GATES = auto()
+    REPLAY = auto()
+    CEO_FINAL_REVIEW = auto()
+    COMPLETE = auto()
+    ERROR = auto()
+
+class GovernanceError(Exception):
+    """Raised when a governance invariant is violated."""
+    pass
+
+class RuntimeFSM:
+    """
+    Deterministic Finite State Machine for the COO Runtime.
+    Enforces strict linear progression and halts on ambiguity.
+    """
+
+    def __init__(self):
+        self.__current_state = RuntimeState.INIT
+        self._history: List[RuntimeState] = [RuntimeState.INIT]
+        
+        # Define allowed transitions (Strict Linear Progression)
+        self._transitions: Dict[RuntimeState, List[RuntimeState]] = {
+            RuntimeState.INIT: [RuntimeState.AMENDMENT_PREP, RuntimeState.ERROR],
+            RuntimeState.AMENDMENT_PREP: [RuntimeState.AMENDMENT_EXEC, RuntimeState.ERROR],
+            RuntimeState.AMENDMENT_EXEC: [RuntimeState.AMENDMENT_VERIFY, RuntimeState.ERROR],
+            RuntimeState.AMENDMENT_VERIFY: [RuntimeState.CEO_REVIEW, RuntimeState.ERROR],
+            RuntimeState.CEO_REVIEW: [RuntimeState.FREEZE_PREP, RuntimeState.ERROR],
+            RuntimeState.FREEZE_PREP: [RuntimeState.FREEZE_ACTIVATED, RuntimeState.ERROR],
+            RuntimeState.FREEZE_ACTIVATED: [RuntimeState.CAPTURE_AMU0, RuntimeState.ERROR],
+            RuntimeState.CAPTURE_AMU0: [RuntimeState.MIGRATION_SEQUENCE, RuntimeState.ERROR],
+            RuntimeState.MIGRATION_SEQUENCE: [RuntimeState.GATES, RuntimeState.ERROR, RuntimeState.CAPTURE_AMU0],
+            RuntimeState.GATES: [RuntimeState.REPLAY, RuntimeState.ERROR, RuntimeState.CAPTURE_AMU0],
+            RuntimeState.REPLAY: [RuntimeState.CEO_FINAL_REVIEW, RuntimeState.ERROR, RuntimeState.CAPTURE_AMU0],
+            RuntimeState.CEO_FINAL_REVIEW: [RuntimeState.COMPLETE, RuntimeState.ERROR],
+            RuntimeState.COMPLETE: [], # Terminal state
+            RuntimeState.ERROR: [],    # Terminal state (requires manual intervention/restart)
+        }
+
+    @property
+    def current_state(self) -> RuntimeState:
+        return self.__current_state
+
+    @property
+    def history(self) -> List[RuntimeState]:
+        return list(self._history)
+
+    def transition_to(self, next_state: RuntimeState) -> None:
+        """
+        Executes a state transition.
+        Raises GovernanceError if the transition is invalid.
+        """
+        if next_state not in self._transitions[self.__current_state]:
+            # Invalid transition attempt -> Immediate Halt & Error
+            self._force_error(f"Invalid transition attempted: {self.__current_state} -> {next_state}")
+            return
+
+        # Governance State Hardening (R3)
+        strict_states = [
+            RuntimeState.FREEZE_ACTIVATED,
+            RuntimeState.CEO_REVIEW,
+            RuntimeState.CEO_FINAL_REVIEW
+        ]
+        
+        if next_state in strict_states:
+            if os.environ.get("COO_STRICT_MODE", "0") != "1":
+                self._force_error(f"Strict Mode Required for transition to {next_state}")
+                return
+
+        self.__current_state = next_state
+        self._history.append(next_state)
+
+    def _force_error(self, reason: str) -> None:
+        """
+        Forces the FSM into the ERROR state and raises a GovernanceError.
+        Used for any ambiguous or invalid condition.
+        """
+        self.__current_state = RuntimeState.ERROR
+        self._history.append(RuntimeState.ERROR)
+        raise GovernanceError(f"RUNTIME HALT: {reason}. Please raise a QUESTION to the CEO.")
+
+    def assert_state(self, expected_state: RuntimeState) -> None:
+        """
+        Verifies that the FSM is in the expected state.
+        """
+        if self.__current_state != expected_state:
+            self._force_error(f"State assertion failed. Expected {expected_state}, got {self.__current_state}")
+  
+=== E2E_PROOF_OF_LIFE.PY ===  
+import os
+import sys
+import shutil
+import json
+import logging
+import subprocess
+import unittest
+import hashlib
+from typing import Dict, Any
+
+# Add repo root to path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
+
+from coo_runtime.runtime.state_machine import RuntimeFSM, RuntimeState, GovernanceError
+from coo_runtime.runtime.migration import MigrationEngine
+from coo_runtime.runtime.rollback import RollbackEngine
+from coo_runtime.runtime.gates import GateKeeper
+from coo_runtime.runtime.replay import ReplayEngine
+from coo_runtime.runtime.amu_capture import AMUCapture
+
+class TestE2EProofOfLife(unittest.TestCase):
+
+    def setUp(self):
+        self.test_dir = "e2e_test_env"
+        if os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir)
+        os.makedirs(self.test_dir)
+        
+        # Setup directories
+        self.pb_root = os.path.join(self.test_dir, "project_builder")
+        self.coo_root = os.path.join(self.test_dir, "coo")
+        self.manifests_dir = os.path.join(self.test_dir, "manifests")
+        self.amu_dir = os.path.join(self.test_dir, "amu0_capture")
+        
+        os.makedirs(self.pb_root)
+        os.makedirs(self.manifests_dir)
+        
+        # Create dummy PB content
+        with open(os.path.join(self.pb_root, "main.py"), "w") as f:
+            f.write("print('Hello from PB')\n")
+            
+        # Create dummy manifests
+        with open(os.path.join(self.manifests_dir, "environment_manifest.json"), "w") as f:
+            json.dump({
+                "allowed_env_vars": ["PATH", "HOME"],
+                "rng_seed": "TEST_SEED",
+                "mock_time": "2025-01-01T00:00:00Z"
+            }, f)
+            
+        with open(os.path.join(self.manifests_dir, "hardware_manifest.json"), "w") as f:
+            json.dump({}, f)
+            
+        with open(os.path.join(self.manifests_dir, "sandbox_manifest.json"), "w") as f:
+            json.dump({"image_sha256": "SHA256_TEST"}, f)
+            
+        with open(os.path.join(self.manifests_dir, "governance_ruleset.json"), "w") as f:
+            json.dump([], f)
+            
+        # Create dummy reference mission
+        self.mission_path = os.path.join(self.test_dir, "phase3_reference_mission.json")
+        with open(self.mission_path, "w") as f:
+            f.write(json.dumps({"mission": "test"}))
+            
+        # Create dummy test runner
+        self.test_runner = os.path.join(self.test_dir, "run_tests.py")
+        with open(self.test_runner, "w") as f:
+            f.write("print('Tests Passed')\n")
+            
+        # Create dummy coo directory
+        if not os.path.exists(self.coo_root):
+            os.makedirs(self.coo_root)
+        with open(os.path.join(self.coo_root, "orchestrator.py"), "w") as f:
+            f.write("# Dummy Orchestrator\n")
+            
+        # Capture AMU0 (Mocking the capture process or using the class)
+        capture = AMUCapture()
+        # We need to change CWD to test_dir for relative paths to work if needed, 
+        # but AMUCapture takes args.
+        # AMUCapture writes to "amu0_capture" in CWD.
+        # We should probably run this test in self.test_dir.
+        self.original_cwd = os.getcwd()
+        os.chdir(self.test_dir)
+        
+        # Capture AMU0
+        capture.capture_amu0("manifests", "phase3_reference_mission.json")
+        
+        # Create signature
+        with open("amu0_capture/signature.sig", "w") as f:
+            f.write("MOCK_SIG")
+
+    def tearDown(self):
+        os.chdir(self.original_cwd)
+        # shutil.rmtree(self.test_dir) # Keep for inspection if failed
+
+    def test_full_migration_success(self):
+        print("\n--- Testing Full Migration Success (R3) ---")
+        
+        fsm = RuntimeFSM()
+        rollback = RollbackEngine(fsm)
+        migration = MigrationEngine(fsm, rollback)
+        replay = ReplayEngine(fsm)
+        gate_keeper = GateKeeper(fsm, replay)
+        
+        # Fast forward FSM
+        self._fast_forward_fsm(fsm)
+        
+        # 1. Phase 1
+        migration.execute_migration_phase_1("project_builder", "coo", "run_tests.py")
+        
+        # 2. Transition
+        fsm.transition_to(RuntimeState.GATES)
+        
+        # 3. Pre-Replay Gates
+        gate_keeper.run_pre_replay_gates("coo", "manifests", "run_tests.py")
+        
+        # 4. Cleanup
+        migration.finalize_migration_cleanup("project_builder")
+        
+        # 5. Replay Gate
+        # Mock Orchestrator imports if needed, or rely on them being present.
+        # Since we are running in the repo root context, it should find 'coo'.
+        gate_keeper.run_replay_gate("coo", "manifests")
+        
+        # Verify
+        self.assertTrue(os.path.exists("coo"))
+        self.assertFalse(os.path.exists("project_builder"))
+        self.assertTrue(os.path.exists("replay_output_run1"))
+        
+        # Verify AMU0 Snapshot (R3)
+        self.assertTrue(os.path.exists("amu0_capture/fs_snapshot"))
+        self.assertTrue(os.path.exists("amu0_capture/snapshot_manifest.json"))
+        self.assertTrue(os.path.exists("amu0_capture/signature.sig"))
+
+    def test_rollback_snapshot_corruption(self):
+        print("\n--- Testing Rollback Snapshot Corruption (R3) ---")
+        
+        fsm = RuntimeFSM()
+        rollback = RollbackEngine(fsm)
+        migration = MigrationEngine(fsm, rollback)
+        replay = ReplayEngine(fsm)
+        gate_keeper = GateKeeper(fsm, replay)
+        
+        self._fast_forward_fsm(fsm)
+        
+        # Run migration to create snapshot
+        migration.execute_migration_phase_1("project_builder", "coo", "run_tests.py")
+        
+        # Corrupt Snapshot
+        with open("amu0_capture/fs_snapshot/project_builder/main.py", "w") as f:
+            f.write("CORRUPTED")
+            
+        # Trigger Rollback via Gate Failure
+        fsm.transition_to(RuntimeState.GATES)
+        shutil.rmtree("coo") # Fail Gate A
+        
+        # Expect Rollback to Fail due to corruption
+        # RollbackEngine catches exception and calls _force_error -> raises GovernanceError
+        with self.assertRaises(GovernanceError) as cm:
+            try:
+                gate_keeper.run_pre_replay_gates("coo", "manifests", "run_tests.py")
+            except GovernanceError:
+                rollback.execute_rollback()
+                
+        self.assertIn("Snapshot Corrupt", str(cm.exception))
+
+    def test_strict_mode_enforcement(self):
+        print("\n--- Testing Strict Mode Enforcement (R3) ---")
+        
+        fsm = RuntimeFSM()
+        
+        # Fast forward to CEO_REVIEW
+        fsm.transition_to(RuntimeState.AMENDMENT_PREP)
+        fsm.transition_to(RuntimeState.AMENDMENT_EXEC)
+        fsm.transition_to(RuntimeState.AMENDMENT_VERIFY)
+        
+        # Try transition to CEO_REVIEW without strict mode
+        if "COO_STRICT_MODE" in os.environ:
+            del os.environ["COO_STRICT_MODE"]
+            
+        with self.assertRaises(GovernanceError) as cm:
+            fsm.transition_to(RuntimeState.CEO_REVIEW)
+        self.assertIn("Strict Mode Required", str(cm.exception))
+        
+        # Enable Strict Mode
+        os.environ["COO_STRICT_MODE"] = "1"
+        
+        # Create new FSM since previous one is in ERROR state
+        fsm = RuntimeFSM()
+        fsm.transition_to(RuntimeState.AMENDMENT_PREP)
+        fsm.transition_to(RuntimeState.AMENDMENT_EXEC)
+        fsm.transition_to(RuntimeState.AMENDMENT_VERIFY)
+        
+        fsm.transition_to(RuntimeState.CEO_REVIEW)
+        self.assertEqual(fsm.current_state, RuntimeState.CEO_REVIEW)
+        
+        del os.environ["COO_STRICT_MODE"]
+
+    def test_replay_failure_nondeterminism(self):
+        print("\n--- Testing Replay Failure (Nondeterminism) ---")
+        # R3: Replay uses Orchestrator. Nondeterminism is harder to inject without mocking the mock.
+        # But we can mock the ReplayEngine._run_mission to return different DBs.
+        
+        fsm = RuntimeFSM()
+        replay = ReplayEngine(fsm)
+        gate_keeper = GateKeeper(fsm, replay)
+        
+        self._fast_forward_fsm(fsm)
+        fsm.transition_to(RuntimeState.GATES)
+        
+        # Mock _run_mission
+        original_run = replay._run_mission
+        def mock_run(mission_path, run_id):
+            try:
+                out = original_run(mission_path, run_id)
+                # Modify DB to cause mismatch
+                import sqlite3
+                db_path = os.path.join(out, "mission.db")
+                conn = sqlite3.connect(db_path)
+                conn.execute(f"UPDATE missions SET description = description || '_nondet_{run_id}'")
+                conn.commit()
+                conn.close()
+                return out
+            except Exception as e:
+                print(f"DEBUG: mock_run failed: {e}")
+                raise e
+            
+        replay._run_mission = mock_run
+        
+        with self.assertRaises(GovernanceError) as cm:
+            gate_keeper.run_replay_gate("coo", "manifests")
+            
+        self.assertIn("Deterministic Replay Failed", str(cm.exception))
+
+    def _fast_forward_fsm(self, fsm):
+        # R3: Strict mode required for some transitions
+        os.environ["COO_STRICT_MODE"] = "1"
+        try:
+            fsm.transition_to(RuntimeState.AMENDMENT_PREP)
+            fsm.transition_to(RuntimeState.AMENDMENT_EXEC)
+            fsm.transition_to(RuntimeState.AMENDMENT_VERIFY)
+            fsm.transition_to(RuntimeState.CEO_REVIEW)
+            fsm.transition_to(RuntimeState.FREEZE_PREP)
+            fsm.transition_to(RuntimeState.FREEZE_ACTIVATED)
+            fsm.transition_to(RuntimeState.CAPTURE_AMU0)
+            fsm.transition_to(RuntimeState.MIGRATION_SEQUENCE)
+        finally:
+            # Clean up env var to avoid polluting other tests
+            if "COO_STRICT_MODE" in os.environ:
+                del os.environ["COO_STRICT_MODE"]
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,273 @@
+R4 FIX PACKET — COO Runtime v1.0
+
+Source: Chair Review (R3) + Cross-Lens Consolidation
+Purpose: Implement all blocking fixes required for “ACCEPT”
+
+STRICT SCOPE
+
+This packet contains only the 7 blocking fixes identified by the Chair.
+No optional refactoring or improvements.
+No architectural redesign.
+This packet is binding.
+
+FILES AFFECTED
+
+You are expected to modify (or create) code in:
+
+coo_runtime/amu_capture.py
+
+coo_runtime/rollback.py
+
+coo_runtime/replay.py
+
+coo_runtime/state_machine.py
+
+coo_runtime/gates.py
+
+coo_runtime/migration.py
+
+coo_runtime/manifests/*.json (write paths only, not redesign schema)
+
+run_migration.py
+
+coo_runtime/util/crypto.py (new)
+
+coo_runtime/util/context.py (new or expanded)
+
+coo_runtime/tests/e2e_* (minimal extension)
+
+==========================================
+BLOCKING FIX B1 — REAL CRYPTOGRAPHIC SIGNATURES
+==========================================
+Requirement
+
+Replace mock signatures (SIG_<digest>_CEO_KEY) with real signature verification using Ed25519.
+
+Implementation Requirements
+
+Add new file: coo_runtime/util/crypto.py
+Implement:
+
+from nacl.signing import VerifyKey, SigningKey
+
+def sign_bytes(private_key_path: str, data: bytes) -> bytes:
+    sk = SigningKey(open(private_key_path, "rb").read())
+    return sk.sign(data).signature
+
+def verify_signature(public_key_path: str, data: bytes, signature: bytes) -> bool:
+    vk = VerifyKey(open(public_key_path, "rb").read())
+    try:
+        vk.verify(data, signature)
+        return True
+    except Exception:
+        return False
+
+
+No mocks, no bypass.
+
+Modify AMUCapture._sign_amu0()
+
+Load CEO private key from manifests/ceo_private_key.pem
+
+Generate canonical AMU0 hash: hashlib.sha256(<all files in sorted order>)
+
+Save signature to: amu0_capture/signature.sig (raw bytes)
+
+Modify RollbackEngine._verify_amu0_signature()
+
+Load CEO public key from manifests/ceo_public_key.pem
+
+Reject (GovernanceError) if signature missing or invalid
+
+No DEV-mode bypass allowed
+
+STRICT_MODE does not change signature logic
+
+Signature verification always required
+
+DEV mode must behave identically for signature verification
+
+==========================================
+BLOCKING FIX B2 — ENFORCE PINNED CONTEXT
+==========================================
+Requirement
+
+Pinned context must be enforced, not just stored.
+
+Implementation Requirements
+
+Create file: coo_runtime/util/context.py with:
+
+def apply_pinned_context(pinned_context_path: str):
+    ctx = json.load(open(pinned_context_path))
+
+    # 1. RNG
+    random.seed(ctx["rng_seed"])
+
+    # 2. ENV VARS (replace all non-allowed vars)
+    os.environ.clear()
+    for k, v in ctx["env_vars"].items():
+        os.environ[k] = v
+
+    # 3. Mock time (STRICT mode only)
+    if ctx.get("mock_time") is not None:
+        os.environ["FAKETIME"] = ctx["mock_time"]  # for libfaketime
+
+Integrations:
+
+MigrationEngine.execute_migration_phase_1()
+
+Call apply_pinned_context("amu0_capture/pinned_context.json") before any work.
+
+ReplayEngine.execute_replay()
+
+Call same before running mission.
+
+Add verification:
+
+Compare ctx["kernel_version"] vs platform.release()
+
+Compare NUMA topology & CPU microcode if present
+
+If mismatch → GovernanceError("Pinned context mismatch")
+
+==========================================
+BLOCKING FIX B3 — UNIQUE, IMMUTABLE AMU0 IDENTITY
+==========================================
+Requirement
+
+Each AMU0 must have a unique directory and must never be overwritten.
+
+Implementation Requirements
+
+Modify AMUCapture.capture_amu0():
+
+Create directory:
+amu0_<uuid4()>
+e.g., amu0_f81d4fae7dec11d0a76500a0c91e6bf6/
+
+Write AMU0 ID to:
+amu0_id.txt
+
+Modify all modules referencing AMU0:
+
+Replace hardcoded "amu0_capture" paths with dynamic lookup:
+
+coo_runtime/state_machine.py or config stores active AMU0 path
+
+Run_migration.py sets AMU0 path after capture
+
+RollbackEngine, ReplayEngine, GateKeeper must load AMU0 path from:
+
+active_amu0_path.txt at repo root
+
+Created immediately after AMUCapture
+
+Reject if AMU0 directory already exists.
+
+==========================================
+BLOCKING FIX B4 — PERSISTENT ROLLBACK USAGE (ONE ROLLBACK RULE)
+==========================================
+Requirement
+
+Rollback usage must survive process restarts and must be tied to AMU0 identity.
+
+Implementation Requirements
+
+Create file: amu0_<id>/rollback_state.json with:
+
+{"rollback_used": false}
+
+
+Modify RollbackEngine.execute_rollback():
+
+Load rollback_state.json
+
+If "rollback_used": true → hard fail (GovernanceError)
+
+After successful rollback, set "rollback_used": true and save
+
+Remove _rollback_count instance variable entirely.
+
+==========================================
+BLOCKING FIX B5 — AUTOMATIC ROLLBACK WIRING
+==========================================
+Requirement
+
+Rollback must be automatically triggered by migration/gates failures, not manually invoked.
+
+Implementation Requirements
+
+GateKeeper.init():
+
+Accept rollback engine instance.
+
+In every run_pre_replay_gates() and run_replay_gate():
+
+try:
+    <gate logic>
+except GovernanceError:
+    rollback_engine.execute_rollback()
+    raise
+
+
+In MigrationEngine.execute_migration_phase_1():
+
+Wrap entire method body in try/except → on any exception → rollback → re-raise
+
+==========================================
+BLOCKING FIX B6 — RESOLVE GATES vs REPLAY FSM STATE
+==========================================
+Requirement
+
+Dead/unused REPLAY state must be removed OR replay must move to REPLAY state.
+
+Implementation Options (choose one)
+Option A (preferred): Remove REPLAY state
+
+Changes:
+
+Delete REPLAY from state enum
+
+Treat Gate F as part of GATES
+
+FSM transitions: MIGRATION_SEQUENCE → GATES → CEO_FINAL_REVIEW
+
+Option B: Make REPLAY active
+
+Changes:
+
+Transition GATES → REPLAY before Gate F
+
+ReplayEngine asserts state == REPLAY
+
+Remove Gate F from GATES entirely
+
+==========================================
+BLOCKING FIX B7 — SANDBOX & HARDWARE VERIFICATION
+==========================================
+Sandbox Verification
+
+Modify Gate D:
+
+Load sandbox_manifest.json → extract "image_sha256"
+
+Run:
+
+import docker
+image = docker.from_env().images.get("coo_sandbox:latest")
+actual_sha = image.id.split(":")[1]
+if actual_sha != manifest_sha:
+    raise GovernanceError("Sandbox SHA mismatch")
+
+Hardware Verification
+
+In apply_pinned_context():
+
+Compare pinned CPU microcode vs /proc/cpuinfo
+
+Compare pinned kernel version vs platform.release()
+
+If mismatch → raise GovernanceError
+
+END OF FIX PACKET

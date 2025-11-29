@@ -55,8 +55,8 @@ class RuntimeFSM:
             RuntimeState.ERROR: [],    # Terminal state (requires manual intervention/restart)
         }
         
-        # Attempt to load state from disk
-        self.load_state()
+        # Attempt to load state from disk - REMOVED (A.3)
+        # self.load_state()
 
     @property
     def current_state(self) -> RuntimeState:
@@ -90,7 +90,8 @@ class RuntimeFSM:
 
         self.__current_state = next_state
         self._history.append(next_state)
-        self.save_state()
+        # Legacy fsm_state.json persistence is removed entirely. (A.3)
+        # Checkpoints are now explicit via checkpoint_state().
 
     def _force_error(self, reason: str) -> None:
         """
@@ -99,7 +100,6 @@ class RuntimeFSM:
         """
         self.__current_state = RuntimeState.ERROR
         self._history.append(RuntimeState.ERROR)
-        self.save_state()
         raise GovernanceError(f"RUNTIME HALT: {reason}. Please raise a QUESTION to the CEO.")
 
     def assert_state(self, expected_state: RuntimeState) -> None:
@@ -109,36 +109,98 @@ class RuntimeFSM:
         if self.__current_state != expected_state:
             self._force_error(f"State assertion failed. Expected {expected_state}, got {self.__current_state}")
 
-    def save_state(self, filepath: str = "fsm_state.json") -> None:
+    def checkpoint_state(self, checkpoint_name: str, amu0_path: str) -> None:
         """
-        Persists the current state to disk.
+        Creates a signed checkpoint of the FSM state (A.3).
+        Allowed only at constitutional boundaries:
+        - After CAPTURE_AMU0
+        - After GATES
+        - Before CEO_FINAL_REVIEW (which is effectively after GATES transition)
         """
-        data = {
-            "current_state": self.__current_state.name,
-            "history": [s.name for s in self._history]
-        }
-        with open(filepath, "w") as f:
-            json.dump(data, f)
+        allowed_states = [
+            RuntimeState.CAPTURE_AMU0,
+            RuntimeState.GATES,
+            RuntimeState.CEO_FINAL_REVIEW
+        ]
+        
+        if self.__current_state not in allowed_states:
+             raise GovernanceError(f"Checkpointing not allowed in state {self.__current_state}")
 
-    def load_state(self, filepath: str = "fsm_state.json") -> None:
-        """
-        Loads state from disk.
-        """
-        if not os.path.exists(filepath):
-            return
+        # Get Pinned Time (A.3)
+        context_path = os.path.join(amu0_path, "pinned_context.json")
+        if not os.path.exists(context_path):
+            raise GovernanceError("pinned_context.json missing. Cannot checkpoint with pinned time.")
             
-        try:
-            with open(filepath, "r") as f:
-                data = json.load(f)
-                
-            state_name = data.get("current_state")
-            if state_name:
-                self.__current_state = RuntimeState[state_name]
-                
-            history_names = data.get("history", [])
-            self._history = [RuntimeState[s] for s in history_names]
+        with open(context_path, "r") as f:
+            context = json.load(f)
+        
+        if "mock_time" not in context:
+            raise GovernanceError("mock_time missing in pinned_context.json")
             
-        except Exception as e:
-            # If state load fails, we default to INIT but log/warn?
-            # For now, we just raise because corrupted state is fatal.
-            raise GovernanceError(f"Failed to load FSM state: {e}")
+        timestamp = context["mock_time"]
+
+        data = {
+            "checkpoint_name": checkpoint_name,
+            "current_state": self.__current_state.name,
+            "history": [s.name for s in self._history],
+            "timestamp": timestamp
+        }
+        
+        payload_bytes = json.dumps(data, sort_keys=True).encode("utf-8")
+        
+        # Sign
+        private_key_path = os.path.join(os.path.dirname(__file__), "../../coo_runtime/manifests/ceo_private_key.pem")
+        if not os.path.exists(private_key_path):
+             raise GovernanceError("CEO Private Key missing. Cannot sign FSM checkpoint.")
+             
+        from ..util.crypto import sign_bytes # Import here to avoid circular dependency if any
+        signature = sign_bytes(private_key_path, payload_bytes)
+        
+        # Write
+        filename = f"fsm_checkpoint_{checkpoint_name}.json"
+        with open(filename, "w") as f:
+            json.dump(data, f, sort_keys=True)
+            
+        with open(f"{filename}.sig", "wb") as f:
+            f.write(signature)
+
+    def load_checkpoint(self, checkpoint_name: str) -> None:
+        """
+        Loads a signed FSM checkpoint.
+        """
+        filename = f"fsm_checkpoint_{checkpoint_name}.json"
+        sig_filename = f"{filename}.sig"
+        
+        if not os.path.exists(filename) or not os.path.exists(sig_filename):
+            raise GovernanceError(f"Checkpoint {checkpoint_name} missing.")
+            
+        # Verify Signature
+        public_key_path = os.path.join(os.path.dirname(__file__), "../../coo_runtime/manifests/ceo_public_key.pem")
+        if not os.path.exists(public_key_path):
+             raise GovernanceError("CEO Public Key missing. Cannot verify FSM checkpoint.")
+             
+        with open(filename, "r") as f:
+            data = json.load(f)
+            
+        with open(sig_filename, "rb") as f:
+            signature = f.read()
+            
+        payload_bytes = json.dumps(data, sort_keys=True).encode("utf-8")
+        
+        from ..util.crypto import verify_signature
+        if not verify_signature(public_key_path, payload_bytes, signature):
+            raise GovernanceError(f"FSM Checkpoint {checkpoint_name} Signature Invalid!")
+            
+        # Restore State
+        self.__current_state = RuntimeState[data["current_state"]]
+        self._history = [RuntimeState[s] for s in data["history"]]
+        
+        # Validate History (A.3)
+        # Check if the history is a valid path in the transition graph
+        for i in range(len(self._history) - 1):
+            curr = self._history[i]
+            next_s = self._history[i+1]
+            if next_s not in self._transitions[curr] and next_s != RuntimeState.ERROR:
+                 # ERROR is allowed jump from anywhere usually, but let's be strict
+                 # The transitions dict defines valid next states.
+                 raise GovernanceError(f"Invalid transition in checkpoint history: {curr} -> {next_s}")

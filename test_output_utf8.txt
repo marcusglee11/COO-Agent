@@ -1,0 +1,45 @@
+python : C:\Users\cabra\Projects\COOProject\coo-agent\coo_runti
+me\util\crypto.py:32: ResourceWarning: unclosed file 
+<_io.BufferedReader name='C:\\Users\\cabra\\Projects\\COOProjec
+t\\coo-agent\\coo_runtime\\runtime\\../../coo_runtime/manifests
+/ceo_private_key.pem'>
+At line:1 char:131
++ ... s\ceo.pub"; python -m unittest 
+coo_runtime/tests/e2e_proof_of_life.py ...
++                 
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Users\cabra\.. 
+   .ivate_key.pem'>:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  sk = SigningKey(open(private_key_path, "rb").read())
+ResourceWarning: Enable tracemalloc to get the object 
+allocation traceback
+C:\Users\cabra\Projects\COOProject\coo-agent\coo_runtime\util\c
+rypto.py:46: ResourceWarning: unclosed file 
+<_io.BufferedReader name='C:\\Users\\cabra\\Projects\\COOProjec
+t\\coo-agent\\coo_runtime\\util\\../../coo_runtime/manifests/ce
+o_public_key.pem'>
+  vk = VerifyKey(open(public_key_path, "rb").read())
+ResourceWarning: Enable tracemalloc to get the object 
+allocation traceback
+Tests Passed
+.Bundle Hash Mismatch: 7675be301be46b15dd2d21070a7925fb2ec8d3bb
+7cdbd1bada168ed4413d605e vs 10fe5fdd8aeeb5ad6b0c7de88bf64ff892e
+4661e7e997e4baf94acb1602cd1d8
+Gate Failure (F): Deterministic Replay Failed: Outputs do not 
+match byte-for-byte.
+...
+---------------------------------------------------------------
+-------
+Ran 4 tests in 0.462s
+
+OK
+
+--- Testing Full Migration Success (R3) ---
+
+--- Testing Replay Failure (Nondeterminism) ---
+
+--- Testing Rollback Snapshot Corruption (R3) ---
+
+--- Testing Strict Mode Enforcement (R3) ---

@@ -10,19 +10,20 @@ from ..util.crypto import verify_signature
 
 def resolve_amu0_path() -> str:
     """
-    Resolves the active AMU0 path from the signed tracker (active_amu0.json).
+    Resolves the active AMU0 path from the signed tracker (active_amu0_path.json).
     Verifies:
-    1. Tracker signature (A.2)
-    2. AMU0 ID matches canonical hash of the directory (A.2, A.3)
+    1. Tracker signature (active_amu0_path.json.sig) using CEO Public Key.
+    2. AMU0 ID matches canonical hash of the directory (A.2, A.3).
     """
-    tracker_path = os.path.join(os.getcwd(), "active_amu0.json")
+    tracker_path = os.path.join(os.getcwd(), "active_amu0_path.json")
+    sig_path = os.path.join(os.getcwd(), "active_amu0_path.json.sig")
     public_key_path = os.path.join(os.path.dirname(__file__), "../../coo_runtime/manifests/ceo_public_key.pem")
     
     if not os.path.exists(tracker_path):
-         # Fallback for bootstrapping/tests if json doesn't exist yet? 
-         # R6 implies strictness. But let's check if txt exists for backward compat during migration?
-         # No, R6 is a fix packet. We should enforce the new way.
-         raise GovernanceError("Active AMU0 tracker (active_amu0.json) not found.")
+         raise GovernanceError("Active AMU0 tracker (active_amu0_path.json) not found.")
+
+    if not os.path.exists(sig_path):
+         raise GovernanceError("Active AMU0 tracker signature (active_amu0_path.json.sig) not found.")
 
     if not os.path.exists(public_key_path):
         raise GovernanceError("CEO Public Key missing. Cannot verify active AMU0 tracker.")
@@ -31,43 +32,40 @@ def resolve_amu0_path() -> str:
         with open(tracker_path, "r") as f:
             data = json.load(f)
     except json.JSONDecodeError:
-        raise GovernanceError("active_amu0.json is corrupted.")
+        raise GovernanceError("active_amu0_path.json is corrupted.")
 
     # 1. Verify Tracker Signature
-    if "amu0_id" not in data or "path" not in data or "signature" not in data:
-        raise GovernanceError("active_amu0.json missing required fields.")
+    required_fields = ["amu0_path", "amu0_id", "created_at", "repo_commit"]
+    for field in required_fields:
+        if field not in data:
+            raise GovernanceError(f"active_amu0_path.json missing required field: {field}")
 
     # Reconstruct payload for verification (canonical JSON)
-    payload = {
-        "amu0_id": data["amu0_id"],
-        "path": data["path"]
-    }
-    payload_bytes = json.dumps(payload, sort_keys=True).encode("utf-8")
-    signature = bytes.fromhex(data["signature"])
+    # The signature is over the sorted JSON bytes of the tracker file content
+    payload_bytes = json.dumps(data, sort_keys=True).encode("utf-8")
+    
+    with open(sig_path, "rb") as f:
+        signature = f.read()
 
     if not verify_signature(public_key_path, payload_bytes, signature):
         raise GovernanceError("Active AMU0 Tracker Signature Invalid!")
 
     # 2. Resolve Path
-    path = data["path"]
+    path = data["amu0_path"]
     if not os.path.isabs(path):
         path = os.path.join(os.getcwd(), path)
 
     if not os.path.exists(path):
         raise GovernanceError(f"Resolved AMU0 path does not exist: {path}")
 
-    # 3. Verify AMU0 ID matches Canonical Hash (Binding)
-    # This ensures the directory content matches the ID signed in the tracker.
-    # Note: This is expensive (hashing whole dir). 
-    # R6 A.2 says: "verify that amu0_id matches canonical hash of AMU0".
-    # We should do this.
+    # 3. Verify AMU0 ID matches amu0_id.txt (Fast Check)
+    # R6 A.1 says: "Check amu0_id against amu0_id.txt."
     try:
-        canonical_hash = calculate_canonical_hash(path)
-        derived_id = canonical_hash.hex()[:16]
-        if derived_id != data["amu0_id"]:
-             raise GovernanceError(f"AMU0 ID Mismatch! Tracker: {data['amu0_id']}, Derived: {derived_id}")
+        stored_id = read_amu0_id(path)
+        if stored_id != data["amu0_id"]:
+             raise GovernanceError(f"AMU0 ID Mismatch! Tracker: {data['amu0_id']}, Stored: {stored_id}")
     except GovernanceError as e:
-        raise GovernanceError(f"AMU0 Integrity Check Failed during resolution: {e}")
+        raise GovernanceError(f"AMU0 ID Check Failed: {e}")
 
     return path
 

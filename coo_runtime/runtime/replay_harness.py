@@ -42,10 +42,14 @@ def run_replay_harness(mission_path: str, output_dir: str, amu0_path: str, mode:
     import sqlite3
     try:
         conn = sqlite3.connect(db_path)
-        # WAL mode is persistent and helps with concurrency/determinism in some cases
-        conn.execute("PRAGMA journal_mode = WAL")
-        # Ensure full sync for safety/determinism
+        # R6 A.8: Deterministic DB Enforcement
+        # journal_mode=DELETE (WAL is non-deterministic across runs due to checkpointing timing)
+        conn.execute("PRAGMA journal_mode = DELETE")
         conn.execute("PRAGMA synchronous = FULL")
+        conn.execute("PRAGMA temp_store = MEMORY")
+        conn.execute("PRAGMA locking_mode = EXCLUSIVE")
+        conn.execute("PRAGMA page_size = 4096")
+        conn.execute("PRAGMA auto_vacuum = NONE")
         conn.close()
     except Exception as e:
         logger.warning(f"Failed to set SQLite PRAGMAs: {e}")
@@ -59,29 +63,24 @@ def run_replay_harness(mission_path: str, output_dir: str, amu0_path: str, mode:
             prompt_hash = hashlib.sha256(str(prompt).encode("utf-8")).hexdigest()[:8]
             return f"Mock Response {prompt_hash}"
 
-    class TraceReplayClient:
+    # Import External Trace Replayer (A.7)
+    try:
+        from coo_runtime.runtime.external_trace_replayer import ExternalTraceReplayer
+    except ImportError:
+        # If running as script, path might need adjustment or assume it's in pythonpath
+        # For now, let's assume pythonpath is set correctly by replay.py
+        pass
+
+    class TraceReplayClientAdapter:
+        """
+        Adapter for ExternalTraceReplayer to match ModelClient interface.
+        """
         def __init__(self, config):
-            self.trace = {}
-            trace_path = os.path.join(amu0_path, "external_trace.json")
-            if os.path.exists(trace_path):
-                with open(trace_path, "r") as f:
-                    self.trace = json.load(f)
-            else:
-                # In Deep Mode, missing trace is fatal?
-                # R6 says "Uses frozen traces".
-                # If missing, maybe we fail.
-                logger.error(f"Deep Mode: Trace file missing at {trace_path}")
-                raise RuntimeError("Deep Mode requires external_trace.json")
+            trace_path = os.path.join(amu0_path, "external_trace.jsonl")
+            self.replayer = ExternalTraceReplayer(trace_path)
 
         async def generate(self, prompt, **kwargs):
-            # Look up prompt in trace
-            # Simple exact match or hash match
-            prompt_hash = hashlib.sha256(str(prompt).encode("utf-8")).hexdigest()
-            if prompt_hash in self.trace:
-                return self.trace[prompt_hash]
-            else:
-                logger.error(f"Deep Mode: Prompt not found in trace. Hash: {prompt_hash}")
-                raise RuntimeError("Deep Mode: Prompt deviation detected (not in trace).")
+            return self.replayer.replay_call(prompt)
 
     class DeterministicUUID:
         def __init__(self):
@@ -130,7 +129,7 @@ def run_replay_harness(mission_path: str, output_dir: str, amu0_path: str, mode:
     try:
         # Select Client based on Mode
         if mode == "deep":
-            ClientClass = TraceReplayClient
+            ClientClass = TraceReplayClientAdapter
         else:
             ClientClass = MockModelClient
 

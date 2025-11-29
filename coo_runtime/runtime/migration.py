@@ -86,12 +86,43 @@ class MigrationEngine:
 
     def _update_imports(self, coo_path: str) -> None:
         """
-        Updates imports from 'project_builder' to 'coo' using AST.
-        Fails if untransformable patterns are found (R6 E.1).
-        Preserves formatting by using AST for location finding only.
+        Updates imports from 'project_builder' to 'coo' using Pure AST transformation (A.6).
+        - Parses code into AST.
+        - Transforms AST nodes.
+        - Unparses AST back to source code (No string replacement).
+        - Fails on dynamic imports or forbidden patterns.
         """
         import ast
-        
+
+        class ImportTransformer(ast.NodeTransformer):
+            def visit_Import(self, node):
+                new_names = []
+                for alias in node.names:
+                    if alias.name == "project_builder":
+                        new_names.append(ast.alias(name="coo", asname=alias.asname))
+                    elif alias.name.startswith("project_builder."):
+                        new_name = alias.name.replace("project_builder.", "coo.", 1)
+                        new_names.append(ast.alias(name=new_name, asname=alias.asname))
+                    else:
+                        new_names.append(alias)
+                node.names = new_names
+                return node
+
+            def visit_ImportFrom(self, node):
+                if node.module:
+                    if node.module == "project_builder":
+                        node.module = "coo"
+                    elif node.module.startswith("project_builder."):
+                        node.module = node.module.replace("project_builder.", "coo.", 1)
+                return node
+                
+            def visit_Call(self, node):
+                # Detect dynamic imports/execution (A.6)
+                if isinstance(node.func, ast.Name):
+                    if node.func.id in ["__import__", "eval", "exec"]:
+                        raise GovernanceError(f"Migration Failed: Forbidden dynamic execution '{node.func.id}' detected.")
+                return node
+
         for root, _, files in os.walk(coo_path):
             files.sort()
             for file in files:
@@ -105,44 +136,36 @@ class MigrationEngine:
                     except SyntaxError:
                         raise GovernanceError(f"Migration Failed: Syntax Error in {file}")
 
-                    replacements = []
-                    
+                    # 1. Check for forbidden patterns (importlib)
+                    # We do this by walking before transform or during.
+                    # Let's do a quick check for importlib usage which might be an attribute access
                     for node in ast.walk(tree):
                         if isinstance(node, ast.Import):
                             for alias in node.names:
-                                if alias.name == "project_builder":
-                                    # import project_builder -> import coo
-                                    # We need to find the exact text range.
-                                    # AST doesn't give end col easily in older python.
-                                    # But we can check the line.
-                                    # For simplicity and strictness, if we find it, we replace the whole line?
-                                    # Or we use string replacement ONLY on the lines identified by AST.
-                                    replacements.append((node.lineno, "project_builder", "coo"))
-                                elif alias.name.startswith("project_builder."):
-                                    # import project_builder.foo -> import coo.foo
-                                    replacements.append((node.lineno, "project_builder", "coo"))
-                                    
+                                if alias.name == "importlib" or alias.name.startswith("importlib."):
+                                     raise GovernanceError(f"Migration Failed: Forbidden 'importlib' usage in {file}")
                         elif isinstance(node, ast.ImportFrom):
-                            if node.module and (node.module == "project_builder" or node.module.startswith("project_builder.")):
-                                # from project_builder import ... -> from coo import ...
-                                replacements.append((node.lineno, "project_builder", "coo"))
+                            if node.module and (node.module == "importlib" or node.module.startswith("importlib.")):
+                                 raise GovernanceError(f"Migration Failed: Forbidden 'importlib' usage in {file}")
 
-                    if replacements:
-                        lines = source.splitlines(keepends=True)
-                        for lineno, old, new in replacements:
-                            # 1-based lineno
-                            idx = lineno - 1
-                            if idx < len(lines):
-                                # Verify the line actually contains the target to avoid false positives
-                                if old in lines[idx]:
-                                    lines[idx] = lines[idx].replace(old, new)
-                                else:
-                                    # If AST says it's there but string replace fails, it's ambiguous.
-                                    # R6 says "fail on untransformable patterns".
-                                    raise GovernanceError(f"Migration Failed: Ambiguous import pattern in {file} at line {lineno}")
+                    # 2. Transform
+                    transformer = ImportTransformer()
+                    try:
+                        new_tree = transformer.visit(tree)
+                        ast.fix_missing_locations(new_tree)
+                    except GovernanceError as e:
+                        raise GovernanceError(f"Migration Failed in {file}: {e}")
+
+                    # 3. Unparse (Pure AST)
+                    # Requires Python 3.9+
+                    if sys.version_info < (3, 9):
+                        raise GovernanceError("COO Runtime requires Python 3.9+ for AST unparsing.")
                         
-                        with open(path, "w", encoding="utf-8") as f:
-                            f.writelines(lines)
+                    new_source = ast.unparse(new_tree)
+                    
+                    # Write back
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(new_source)
 
     def _run_tests(self, test_runner: str, env: dict) -> None:
         # Execute test runner

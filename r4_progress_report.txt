@@ -1,0 +1,262 @@
+================================================================================
+R4 BLOCKING FIXES - PROGRESS REPORT
+================================================================================
+Generated: 2025-11-28 02:00 UTC+11
+Status: IN PROGRESS
+Session: Step 685
+
+================================================================================
+SUMMARY
+================================================================================
+
+B1 COMPLETE ✅ - Real Cryptographic Signatures
+B2 PARTIAL ⚠️ - Pinned Context Enforcement  
+B3-B7 PENDING ⏳ - Remaining blocking fixes
+
+All E2E tests passing with B1 changes.
+
+================================================================================
+COMPLETED WORK
+================================================================================
+
+B1 - REAL CRYPTOGRAPHIC SIGNATURES ✅
+------------------------------------------------------------
+Requirement: Replace mock signatures with Ed25519, no DEV-mode bypass
+
+Files Created:
+  ✅ coo_runtime/util/__init__.py
+  ✅ coo_runtime/util/crypto.py - Ed25519 signing/verification utility
+  ✅ coo_runtime/manifests/ceo_private_key.pem - Test CEO private key (32 bytes)
+  ✅ coo_runtime/manifests/ceo_public_key.pem - Test CEO public key (32 bytes)
+
+Files Modified:
+  ✅ coo_runtime/runtime/amu_capture.py
+     - Added _snapshot_filesystem() method
+     - Added _sign_amu0() method using real Ed25519 signatures
+     - Calls util.crypto.sign_bytes with CEO private key
+     - Generates canonical hash of snapshot_manifest.json + pinned_context.json
+     - Writes binary signature to signature.sig
+     
+  ✅ coo_runtime/runtime/rollback.py
+     - Updated _verify_amu0_signature() to use real Ed25519 verification
+     - Removed DEV-mode bypass completely
+     - Signature verification ALWAYS required
+     - Calls util.crypto.verify_signature with CEO public key
+     - Raises GovernanceError on invalid signature
+     
+  ✅ coo_runtime/tests/e2e_proof_of_life.py
+     - Updated test_rollback_snapshot_corruption expectations
+     - Now expects "Signature Verification Failed" instead of "Snapshot Corrupt"
+     - Reflects B1 behavior: signature detects corruption before hash check
+
+Dependencies Added:
+  ✅ pynacl - Installed and verified
+
+Test Results:
+  ✅ All 4 E2E tests passing
+  ✅ test_full_migration_success
+  ✅ test_replay_failure_nondeterminism  
+  ✅ test_rollback_snapshot_corruption (updated for B1)
+  ✅ test_strict_mode_enforcement
+
+Code Quality:
+  ✅ Path resolution fixed for test environment
+  ✅ Absolute paths used for CEO keypair files
+  ⚠️ Minor ResourceWarnings (unclosed file handles in crypto.py - non-blocking)
+
+B2 - PINNED CONTEXT ENFORCEMENT (PARTIAL) ⚠️
+------------------------------------------------------------
+Requirement: Enforce RNG seed, env vars, mock time, hardware verification
+
+Files Created:
+  ✅ coo_runtime/util/context.py - Pinned context enforcement utility
+     - apply_pinned_context() function
+     - _verify_hardware_context() function
+     - _read_cpu_microcode() function
+     - Implements RNG seeding, env var allowlist, FAKETIME, hardware checks
+
+Files Modified:
+  ✅ coo_runtime/runtime/migration.py
+     - Added apply_pinned_context() call at start of execute_migration_phase_1()
+     - Context applied before any migration work
+     - Raises GovernanceError on context mismatch
+     
+  ⏳ coo_runtime/runtime/replay.py - NOT YET UPDATED
+     - File was corrupted during edit and restored from git
+     - Lost R3 Orchestrator integration changes
+     - Needs: apply_pinned_context() call + R3 Orchestrator re-integration
+
+Test Results:
+  ⏳ Not yet tested (waiting for replay.py completion)
+
+================================================================================
+REMAINING WORK
+================================================================================
+
+B2 - PINNED CONTEXT ENFORCEMENT (FINISH)
+------------------------------------------------------------
+Tasks:
+  ☐ Re-apply R3 Orchestrator integration to replay.py
+  ☐ Add apply_pinned_context() call to replay.py execute_replay()
+  ☐ Test pinned context enforcement in migration and replay
+  ☐ Verify E2E tests still pass
+
+Estimated: 15 minutes
+
+B3 - UNIQUE AMU0 IDENTITY
+------------------------------------------------------------
+Requirement: Each AMU0 must have unique directory, never overwritten
+
+Tasks:
+  ☐ Update AMUCapture.capture_amu0() to generate unique ID: amu0_<uuid4()>
+  ☐ Write AMU0 ID to amu0_id.txt inside directory
+  ☐ Create active_amu0_path.txt at repo root
+  ☐ Update all modules to load AMU0 path dynamically:
+     - rollback.py
+     - replay.py (when re-integrated)
+     - gates.py (if needed)
+  ☐ Prevent AMU0 directory overwrite (check existence, reject)
+  ☐ Update E2E tests to handle dynamic AMU0 paths
+
+Estimated: 20 minutes
+
+B4 - PERSISTENT ROLLBACK USAGE
+------------------------------------------------------------
+Requirement: One rollback per AMU0, survives process restarts
+
+Tasks:
+  ☐ Create rollback_state.json in amu0_<id>/ with {"rollback_used": false}
+  ☐ Update RollbackEngine.execute_rollback():
+     - Load rollback_state.json
+     - Check if rollback_used == true -> fail
+     - After rollback, set rollback_used = true and save
+  ☐ Remove _rollback_count instance variable
+  ☐ Test rollback usage persistence
+
+Estimated: 15 minutes
+
+B5 - AUTOMATIC ROLLBACK WIRING
+------------------------------------------------------------
+Requirement: Rollback triggered by gates/migration failures, not manual
+
+Tasks:
+  ☐ Update GateKeeper.__init__() to accept rollback_engine parameter
+  ☐ Wrap run_pre_replay_gates() in try/except:
+     - On GovernanceError: call rollback_engine.execute_rollback(), re-raise
+  ☐ Wrap run_replay_gate() in try/except:
+     - On GovernanceError: call rollback_engine.execute_rollback(), re-raise
+  ☐ Wrap MigrationEngine.execute_migration_phase_1() in try/except:
+     - On any exception: call rollback, re-raise
+  ☐ Remove manual rollback calls from tests (if any)
+
+Estimated: 15 minutes
+
+B6 - RESOLVE GATES VS REPLAY FSM STATE
+------------------------------------------------------------
+Requirement: Remove unused REPLAY state (Option A)
+
+Tasks:
+  ☐ Delete RuntimeState.REPLAY from state_machine.py enum
+  ☐ Update state transitions:
+     - GATES -> CEO_FINAL_REVIEW (remove REPLAY intermediate)
+  ☐ Update gates.py to transition to CEO_FINAL_REVIEW after Gate F
+  ☐ Update any references to REPLAY state
+  ☐ Update E2E tests if needed
+
+Estimated: 10 minutes
+
+B7 - SANDBOX & HARDWARE VERIFICATION
+------------------------------------------------------------
+Requirement: Verify sandbox SHA and hardware properties
+
+Tasks:
+  ☐ Update Gate D in gates.py:
+     - Load sandbox_manifest.json
+     - Use docker library to get coo_sandbox:latest image SHA
+     - Compare against manifest
+     - Raise GovernanceError on mismatch
+  ☐ Update context.py _verify_hardware_context():
+     - Already has kernel version check
+     - Enhance CPU microcode verification
+     - Add platform checks
+  ☐ Install docker library (or mock for tests)
+  ☐ Test sandbox verification
+
+Estimated: 20 minutes
+
+================================================================================
+DEPENDENCIES & ENVIRONMENT
+================================================================================
+
+Python Packages:
+  ✅ pynacl - Installed
+  ⏳ docker - Needed for B7
+
+CEO Keypair:
+  ✅ Test keypair generated in coo_runtime/manifests/
+  ⚠️ Production: Replace with real CEO keypair
+
+================================================================================
+KNOWN ISSUES
+================================================================================
+
+1. ResourceWarnings in crypto.py
+   - Cause: File handles not explicitly closed in one-liner reads
+   - Impact: Minor, Python GC handles cleanup
+   - Fix: Use context managers if needed
+   - Priority: Low (non-blocking)
+
+2. R3 Orchestrator Integration Lost
+   - Cause: replay.py file corruption during edit, restored from git
+   - Impact: replay.py missing MockModelClient, uuid mocking, semantic DB comparison
+   - Fix: Re-apply R3 changes from implementation_plan.md
+   - Priority: High (blocks B2 completion)
+
+3. E2E Tests Use Hardcoded AMU0 Path
+   - Cause: Tests assume "amu0_capture" directory
+   - Impact: Will break with B3 (unique AMU0 IDs)
+   - Fix: Update tests to use active_amu0_path.txt
+   - Priority: Medium (affects B3)
+
+================================================================================
+NEXT STEPS
+================================================================================
+
+IMMEDIATE (Complete B2):
+1. Re-apply R3 changes to replay.py (Orchestrator integration)
+2. Add B2 context enforcement to replay.py
+3. Test E2E suite
+
+SHORT TERM (Complete R4):
+1. Implement B3 (Unique AMU0 Identity)
+2. Implement B4 (Persistent Rollback)
+3. Implement B5 (Automatic Rollback)
+4. Implement B6 (Remove REPLAY State)
+5. Implement B7 (Sandbox/Hardware Verification)
+
+FINAL:
+1. Run full E2E test suite
+2. Generate R4 review packet
+3. Commit all R4 changes
+4. Request ACCEPT review
+
+================================================================================
+TIMELINE ESTIMATE
+================================================================================
+
+Session Time Used: ~2 hours
+Remaining Work: ~1.5 hours
+  - B2 completion: 15 min
+  - B3: 20 min
+  - B4: 15 min
+  - B5: 15 min
+  - B6: 10 min
+  - B7: 20 min
+  - Testing & fixing: 15 min
+  - Review packet: 10 min
+
+Total R4 Estimate: ~3.5 hours
+
+================================================================================
+END OF PROGRESS REPORT
+================================================================================

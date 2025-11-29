@@ -10,7 +10,7 @@ import hashlib
 from typing import Dict, Any
 
 # Add repo root to path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
 from coo_runtime.runtime.state_machine import RuntimeFSM, RuntimeState, GovernanceError
 from coo_runtime.runtime.migration import MigrationEngine
@@ -71,12 +71,19 @@ class TestE2EProofOfLife(unittest.TestCase):
         with open(self.test_runner, "w") as f:
             f.write("print('Tests Passed')\n")
             
+        # Create test_manifest.json (A.11)
+        with open(self.test_runner, "rb") as f:
+            runner_hash = hashlib.sha256(f.read()).hexdigest()
+        with open(os.path.join(self.manifests_dir, "test_manifest.json"), "w") as f:
+            json.dump({"test_runner_sha256": runner_hash}, f)
+            
         # Create dummy coo directory
         if not os.path.exists(self.coo_root):
             os.makedirs(self.coo_root)
         with open(os.path.join(self.coo_root, "orchestrator.py"), "w") as f:
             f.write("# Dummy Orchestrator\n")
             
+        # Capture AMU0 (Mocking the capture process or using the class)
         # Capture AMU0 (Mocking the capture process or using the class)
         capture = AMUCapture()
         # We need to change CWD to test_dir for relative paths to work if needed, 
@@ -87,21 +94,20 @@ class TestE2EProofOfLife(unittest.TestCase):
         os.chdir(self.test_dir)
         
         # Capture AMU0
-        # We need to mock sign_bytes because we don't have a real key in tests usually
-        # But AMUCapture expects one.
-        # We can mock coo_runtime.util.crypto.sign_bytes
         with unittest.mock.patch("coo_runtime.util.crypto.sign_bytes", return_value=b"mock_sig"):
              capture.capture_amu0("manifests", "phase3_reference_mission.json")
-        
-        # B3: Resolve AMU0 path dynamically
-        with open("active_amu0.json", "r") as f:
-            data = json.load(f)
-            self.amu_dir = data["path"]
-        
+
+        self.amu_dir = None
+        if os.path.exists("active_amu0_path.json"):
+            with open("active_amu0_path.json", "r") as f:
+                data = json.load(f)
+                self.amu_dir = data.get("amu0_path")
+
+    @unittest.mock.patch("coo_runtime.util.context.enforce_pinned_context_or_fail", return_value={})
     @unittest.mock.patch("coo_runtime.runtime.replay.enforce_pinned_context_or_fail", return_value={})
     @unittest.mock.patch("coo_runtime.runtime.migration.enforce_pinned_context_or_fail", return_value={})
     @unittest.mock.patch("coo_runtime.util.context._verify_hardware_context")
-    def test_full_migration_success(self, mock_hw, mock_ctx_mig, mock_ctx_rep):
+    def test_full_migration_success(self, mock_hw, mock_ctx_mig, mock_ctx_rep, mock_ctx_gate):
         print("\n--- Testing Full Migration Success (R3) ---")
         
         fsm = RuntimeFSM()
@@ -143,6 +149,7 @@ class TestE2EProofOfLife(unittest.TestCase):
         self.assertTrue(os.path.exists("coo"))
         self.assertFalse(os.path.exists("project_builder"))
         
+        # Verify AMU0 Snapshot (R3)
         # Verify AMU0 Snapshot (R3)
         self.assertTrue(os.path.exists(os.path.join(self.amu_dir, "fs_snapshot")))
         self.assertTrue(os.path.exists(os.path.join(self.amu_dir, "snapshot_manifest.json")))

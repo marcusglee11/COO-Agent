@@ -95,11 +95,11 @@ class TestR6IntegrationDeterminism(unittest.TestCase):
                 gate_keeper._gate_d_sandbox_security(self.manifests_dir)
             self.assertIn("Sandbox SHA mismatch", str(cm.exception))
             
-            # Case 3: Docker Missing
+            # Case 3: Docker Missing (Fail Closed A.5)
             mock_run.side_effect = FileNotFoundError
             with self.assertRaises(GovernanceError) as cm:
                 gate_keeper._gate_d_sandbox_security(self.manifests_dir)
-            self.assertIn("QUESTION: Docker unavailable", str(cm.exception))
+            self.assertIn("Gate D Failed: OCI Runtime (Docker/Podman) unavailable", str(cm.exception))
 
     def test_gate_b_ast_security(self):
         """

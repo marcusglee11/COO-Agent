@@ -1,0 +1,37 @@
+
+--- Testing Full Migration Success (R3) ---
+2025-11-28 00:42:21 [warning  ] prompts_dir_not_found          path=prompts
+C:\Users\cabra\AppData\Roaming\Python\Python312\site-packages\aiosqlite\core.py:115: DeprecationWarning: The default datetime adapter is deprecated as of Python 3.12; see the sqlite3 documentation for suggested replacement recipes
+  result = function()
+.
+--- Testing Replay Failure (Nondeterminism) ---
+2025-11-28 00:42:22 [warning  ] prompts_dir_not_found          path=prompts
+DB Mismatch in table missions
+Rows1: [('00000000-0000-0000-0000-000000000001', 'created', None, 'test_nondet_run1', 5.0, 20, 5, 0, '{}', None, 0.0, 0, 0)]
+Rows2: [('00000000-0000-0000-0000-000000000001', 'created', None, 'test_nondet_run2', 5.0, 20, 5, 0, '{}', None, 0.0, 0, 0)]
+Gate Failure (F): Deterministic Replay Failed: Outputs do not match byte-for-byte.
+.Gate Failure (A-E): Gate A Failed: 'coo' directory missing.
+Initiating Rollback Protocol
+DEV MODE: Signature mismatch (ignoring).
+Rollback Failed: Snapshot Corrupt: Hash mismatch for project_builder\main.py
+.E
+======================================================================
+ERROR: test_strict_mode_enforcement (__main__.TestE2EProofOfLife.test_strict_mode_enforcement)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\cabra\Projects\COOProject\coo-agent\coo_runtime\tests\e2e_proof_of_life.py", line 186, in test_strict_mode_enforcement
+    fsm.transition_to(RuntimeState.CEO_REVIEW)
+  File "C:\Users\cabra\Projects\COOProject\coo-agent\coo_runtime\runtime\state_machine.py", line 72, in transition_to
+    self._force_error(f"Invalid transition attempted: {self.__current_state} -> {next_state}")
+  File "C:\Users\cabra\Projects\COOProject\coo-agent\coo_runtime\runtime\state_machine.py", line 97, in _force_error
+    raise GovernanceError(f"RUNTIME HALT: {reason}. Please raise a QUESTION to the CEO.")
+coo_runtime.runtime.state_machine.GovernanceError: RUNTIME HALT: Invalid transition attempted: RuntimeState.ERROR -> RuntimeState.CEO_REVIEW. Please raise a QUESTION to the CEO.
+
+----------------------------------------------------------------------
+Ran 4 tests in 1.601s
+
+FAILED (errors=1)
+
+--- Testing Rollback Snapshot Corruption (R3) ---
+
+--- Testing Strict Mode Enforcement (R3) ---

@@ -1,0 +1,41 @@
+C:\Users\cabra\Projects\COOProject\coo-agent\coo_runtime\util\crypto.py:18: ResourceWarning: unclosed file <_io.BufferedReader name='C:\\Users\\cabra\\Projects\\COOProject\\coo-agent\\coo_runtime\\manifests\\ceo_private_key.pem'>
+  sk = SigningKey(open(private_key_path, "rb").read())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+
+--- Testing Full Migration Success (R3) ---
+2025-11-28 01:54:12 [warning  ] prompts_dir_not_found          path=prompts
+C:\Users\cabra\AppData\Roaming\Python\Python312\site-packages\aiosqlite\core.py:115: DeprecationWarning: The default datetime adapter is deprecated as of Python 3.12; see the sqlite3 documentation for suggested replacement recipes
+  result = function()
+.C:\Users\cabra\Projects\COOProject\coo-agent\coo_runtime\util\crypto.py:18: ResourceWarning: unclosed file <_io.BufferedReader name='C:\\Users\\cabra\\Projects\\COOProject\\coo-agent\\coo_runtime\\manifests\\ceo_private_key.pem'>
+  sk = SigningKey(open(private_key_path, "rb").read())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+
+--- Testing Replay Failure (Nondeterminism) ---
+2025-11-28 01:54:12 [warning  ] prompts_dir_not_found          path=prompts
+DB Mismatch in table missions
+Rows1: [('00000000-0000-0000-0000-000000000001', 'created', None, 'test_nondet_run1', 5.0, 20, 5, 0, '{}', None, 0.0, 0, 0)]
+Rows2: [('00000000-0000-0000-0000-000000000001', 'created', None, 'test_nondet_run2', 5.0, 20, 5, 0, '{}', None, 0.0, 0, 0)]
+Gate Failure (F): Deterministic Replay Failed: Outputs do not match byte-for-byte.
+.Gate Failure (A-E): Gate A Failed: 'coo' directory missing.
+Initiating Rollback Protocol
+C:\Users\cabra\Projects\COOProject\coo-agent\coo_runtime\util\crypto.py:33: ResourceWarning: unclosed file <_io.BufferedReader name='C:\\Users\\cabra\\Projects\\COOProject\\coo-agent\\coo_runtime\\manifests\\ceo_public_key.pem'>
+  vk = VerifyKey(open(public_key_path, "rb").read())
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+Rollback Failed: AMU0 Signature Verification Failed
+F.
+======================================================================
+FAIL: test_rollback_snapshot_corruption (__main__.TestE2EProofOfLife.test_rollback_snapshot_corruption)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\cabra\Projects\COOProject\coo-agent\coo_runtime\tests\e2e_proof_of_life.py", line 164, in test_rollback_snapshot_corruption
+    self.assertIn("Snapshot Corrupt", str(cm.exception))
+AssertionError: 'Snapshot Corrupt' not found in 'RUNTIME HALT: Rollback Failed: AMU0 Signature Verification Failed. Please raise a QUESTION to the CEO.'
+
+----------------------------------------------------------------------
+Ran 4 tests in 1.812s
+
+FAILED (failures=1)
+
+--- Testing Rollback Snapshot Corruption (R3) ---
+
+--- Testing Strict Mode Enforcement (R3) ---

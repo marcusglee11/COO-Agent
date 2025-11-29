@@ -1,0 +1,15 @@
+python : .....
+At line:1 char:131
++ ... s\ceo.pub"; python -m unittest 
+coo_runtime/tests/test_r6_integration_ ...
++                 
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (.....:String) [], 
+    RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+---------------------------------------------------------------
+-------
+Ran 5 tests in 0.046s
+
+OK

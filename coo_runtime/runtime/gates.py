@@ -41,7 +41,7 @@ class GateKeeper:
             self._gate_a_repo_unification(coo_root)
             self._gate_b_deterministic_modules(coo_root)
             self._gate_d_sandbox_security(manifests_dir)
-            self._gate_c_test_suite_integrity(test_runner_script)
+            self._gate_c_test_suite_integrity(test_runner_script, manifests_dir)
             self._gate_e_governance_integrity(coo_root, manifests_dir)
             self.logger.info("Gates A-E Passed.")
         except Exception as e:
@@ -130,45 +130,81 @@ class GateKeeper:
               raise GovernanceError("Gate D Failed: Invalid SHA256 in manifest.")
               
         # F4: Query actual sandbox digest (R6 B.1)
+        actual_sha = None
+        
+        # Try Docker
         try:
-            # We use docker inspect to get the image ID (SHA256)
-            # Format: sha256:<hash>
             result = subprocess.run(
                 ["docker", "inspect", "--format='{{.Id}}'", "coo-sandbox"],
                 capture_output=True,
                 text=True,
                 check=True
             )
-            actual_sha = result.stdout.strip().replace("'", "") # Remove quotes if present
-            
-            # Docker might return "sha256:..." prefix. Manifest usually has it too or just hash.
-            # Let's normalize.
-            if actual_sha.startswith("sha256:"):
-                actual_sha = actual_sha[7:]
-            if expected_sha.startswith("sha256:"):
-                expected_sha = expected_sha[7:]
-                
+            actual_sha = result.stdout.strip().replace("'", "")
         except (subprocess.CalledProcessError, FileNotFoundError):
-            # If Docker is missing or command fails, we raise a QUESTION.
-            # This allows manual verification or intervention if the runtime is running
-            # in an environment where Docker socket is not directly accessible but sandbox is present.
-            raise GovernanceError("QUESTION: Docker unavailable or sandbox image 'coo-sandbox' not found. Cannot verify SHA.")
+            # Try Podman
+            try:
+                result = subprocess.run(
+                    ["podman", "inspect", "--format='{{.Id}}'", "coo-sandbox"],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                actual_sha = result.stdout.strip().replace("'", "")
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                pass
+
+        if not actual_sha:
+            # Fail Closed (A.5)
+            raise GovernanceError("Gate D Failed: OCI Runtime (Docker/Podman) unavailable or 'coo-sandbox' image not found.")
+
+        # Normalize SHA
+        if actual_sha.startswith("sha256:"):
+            actual_sha = actual_sha[7:]
+        if expected_sha.startswith("sha256:"):
+            expected_sha = expected_sha[7:]
 
         if actual_sha != expected_sha:
             raise GovernanceError(f"Gate D Failed: Sandbox SHA mismatch. Expected: {expected_sha}, Actual: {actual_sha}")
 
-    def _gate_c_test_suite_integrity(self, test_runner_script: str):
-        """Gate C — Test Suite Integrity"""
+    def _gate_c_test_suite_integrity(self, test_runner_script: str, manifests_dir: str = None):
+        """Gate C — Test Suite Integrity (A.11)"""
         self.logger.info("Executing Gate C: Test Suite Integrity")
         
+        # 1. Verify Test Runner Hash (A.11)
+        if manifests_dir:
+            test_manifest_path = os.path.join(manifests_dir, "test_manifest.json")
+            if os.path.exists(test_manifest_path):
+                with open(test_manifest_path, "r") as f:
+                    manifest = json.load(f)
+                expected_sha = manifest.get("test_runner_sha256")
+                
+                if expected_sha:
+                    with open(test_runner_script, "rb") as f:
+                        actual_sha = hashlib.sha256(f.read()).hexdigest()
+                    
+                    if actual_sha != expected_sha:
+                        raise GovernanceError(f"Gate C Failed: Test Runner SHA mismatch. Expected: {expected_sha}, Actual: {actual_sha}")
+                else:
+                    raise GovernanceError("Gate C Failed: test_runner_sha256 missing in test_manifest.json")
+            else:
+                 raise GovernanceError("Gate C Failed: test_manifest.json missing.")
+        else:
+            raise GovernanceError("Gate C Failed: manifests_dir not provided for verification.")
+
         # Run the full test suite and fail on ANY error.
         try:
-            # We assume test_runner_script is an executable python script
+            # R6 A.15: Subprocess Enforcement
+            amu0_path = amu0_utils.resolve_amu0_path()
+            from ..util.context import enforce_pinned_context_or_fail
+            pinned_env = enforce_pinned_context_or_fail(amu0_path)
+            
             result = subprocess.run(
                 [sys.executable, test_runner_script], 
                 check=True, 
                 capture_output=True, 
-                text=True
+                text=True,
+                env=pinned_env
             )
             self.logger.info("Test Suite Passed.")
         except subprocess.CalledProcessError as e:
@@ -190,24 +226,58 @@ class GateKeeper:
         try:
             amu0_path = amu0_utils.resolve_amu0_path()
             ruleset_path = os.path.join(amu0_path, "governance_rules_frozen.json")
-        except GovernanceError:
-            # Fallback to manifests if AMU0 not available (e.g. pre-migration check?)
-            # But R6 implies strictness.
-            # If we are running gates, we expect AMU0.
-            # But if we are running Gate A-E before migration?
-            # The flow is Migration -> Gates -> Replay.
-            # So AMU0 should exist.
-            self.logger.warning("AMU0 not found for Gate E. Falling back to manifests (DEV ONLY).")
-            ruleset_path = os.path.join(manifests_dir, "governance_ruleset.json")
-
-        if not os.path.exists(ruleset_path):
-             raise GovernanceError(f"Gate E Failed: Governance ruleset missing at {ruleset_path}")
-             
-        # Calculate hash of ruleset
-        with open(ruleset_path, "rb") as f:
-            ruleset_hash = hashlib.sha256(f.read()).hexdigest()
+            snapshot_manifest_path = os.path.join(amu0_path, "snapshot_manifest.json")
             
-        scanner.scan(ruleset_path, ruleset_hash, [coo_root])
+            if not os.path.exists(ruleset_path):
+                 raise GovernanceError(f"Gate E Failed: Frozen ruleset missing at {ruleset_path}")
+                 
+            if not os.path.exists(snapshot_manifest_path):
+                 raise GovernanceError("Gate E Failed: Snapshot manifest missing in AMU0.")
+                 
+            with open(snapshot_manifest_path, "r") as f:
+                snapshot_manifest = json.load(f)
+                
+            expected_hash = snapshot_manifest.get("governance_rules_sha256")
+            if not expected_hash:
+                 raise GovernanceError("Gate E Failed: governance_rules_sha256 missing in snapshot manifest.")
+                 
+            # Compute Hash
+            with open(ruleset_path, "rb") as f:
+                actual_hash = hashlib.sha256(f.read()).hexdigest()
+                
+            if actual_hash != expected_hash:
+                 raise GovernanceError(f"Gate E Failed: Frozen ruleset hash mismatch. Expected: {expected_hash}, Actual: {actual_hash}")
+                 
+        except GovernanceError as e:
+            # Fallback only allowed if strictly dev mode and explicitly requested?
+            # R6 implies strictness. "Use frozen ruleset only".
+            # If AMU0 is missing, we can't run Gate E strictly.
+            # But maybe we are running Gate E before AMU0 capture?
+            # No, Gate E is after Gates A-D. AMU0 capture is AFTER Gates.
+            # Wait. The FSM says: GATES -> CAPTURE_AMU0.
+            # So AMU0 does NOT exist when Gates run!
+            # This is a circular dependency in my logic or the spec.
+            # "During capture: compute SHA... During Gate E: Reload snapshot_manifest... Use frozen ruleset".
+            # If Gate E runs BEFORE Capture, how can it use the frozen ruleset from AMU0?
+            
+            # Let's re-read the spec/plan.
+            # A3: "checkpoint_state MUST be called... After GATES... After CAPTURE_AMU0".
+            # A9: "During Gate E: Reload snapshot_manifest... Use frozen ruleset".
+            
+            # If Gates run before Capture, then Gate E cannot verify against AMU0.
+            # Unless... we are verifying a PREVIOUS AMU0? No, that doesn't make sense for a new build.
+            # OR, the Gates run AFTER Capture?
+            # FSM: CAPTURE_AMU0 -> MIGRATION -> GATES.
+            # Ah! `state_machine.py` says:
+            # RuntimeState.CAPTURE_AMU0: [RuntimeState.MIGRATION_SEQUENCE, ...]
+            # RuntimeState.MIGRATION_SEQUENCE: [RuntimeState.GATES, ...]
+            # So Capture happens BEFORE Gates.
+            # So AMU0 EXISTS when Gates run.
+            # My previous assumption was wrong.
+            # So `resolve_amu0_path` should work.
+            raise e
+
+        scanner.scan(ruleset_path, actual_hash, [coo_root])
 
     def _gate_f_deterministic_replay(self, coo_root: str, manifests_dir: str):
         """Gate F — Deterministic Replay"""

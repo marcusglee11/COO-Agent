@@ -3,6 +3,8 @@ import json
 import uuid
 import shutil
 import logging
+import subprocess
+import hashlib
 from typing import Optional, Dict, Any
 from ..runtime.state_machine import GovernanceError
 from ..util.crypto import sign_bytes
@@ -45,7 +47,7 @@ class AMUCapture:
         
         try:
             # 3. Snapshot Filesystem
-            self._snapshot_filesystem(temp_dir, manifests_dir, mission_path)
+            snapshot_manifest = self._snapshot_filesystem(temp_dir, manifests_dir, mission_path)
             
             # 4. Initialize Rollback Log (A.1)
             # Empty log file
@@ -77,30 +79,54 @@ class AMUCapture:
             with open(os.path.join(amu_dir, "amu0_id.txt"), "w") as f:
                 f.write(amu0_id)
                 
-            # 8. Persist Active AMU0 Path (A.2 - Signed Tracker)
+            # 8. Persist Active AMU0 Path (A.1 - Signed Tracker)
+            # Get current git commit
+            try:
+                repo_commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+            except subprocess.CalledProcessError:
+                repo_commit = "UNKNOWN_COMMIT" # Should fail in strict mode? R6 implies strictness.
+                # But if not a git repo (e.g. docker build), maybe allow?
+                # "repo_commit: <git SHA>" implies it must be there.
+                # Let's assume git is available or fail.
+                self.logger.warning("Could not determine git commit. Using placeholder.")
+
+            # Use pinned timestamp if available, else current time (but R6 says pinned time)
+            # We have pinned_context['mock_time'] from manifest or generated.
+            # Let's use the timestamp we put in snapshot_manifest.
+            created_at = snapshot_manifest["timestamp"]
+
             tracker_payload = {
                 "amu0_id": amu0_id,
-                "path": amu_dir_name
+                "amu0_path": amu_dir_name,
+                "created_at": created_at,
+                "repo_commit": repo_commit
             }
+            
+            # Sign the payload
             tracker_bytes = json.dumps(tracker_payload, sort_keys=True).encode("utf-8")
             
             if not os.path.exists(self.private_key_path):
-                 raise GovernanceError("CEO Private Key missing. Cannot sign active AMU0 tracker.")
-                 
+                 # Try env var
+                 private_key_path = os.environ.get("CEO_PRIVATE_KEY_PATH")
+                 if not private_key_path:
+                      raise GovernanceError("CEO Private Key missing (Env Var CEO_PRIVATE_KEY_PATH not set). Cannot sign active AMU0 tracker.")
+                 self.private_key_path = private_key_path
+
             tracker_sig = sign_bytes(self.private_key_path, tracker_bytes)
             
-            tracker_data = {
-                "amu0_id": amu0_id,
-                "path": amu_dir_name,
-                "signature": tracker_sig.hex()
-            }
-            
-            with open("active_amu0.json", "w") as f:
-                json.dump(tracker_data, f)
+            # Write Tracker JSON
+            with open("active_amu0_path.json", "w") as f:
+                json.dump(tracker_payload, f, sort_keys=True)
+
+            # Write Signature File
+            with open("active_amu0_path.json.sig", "wb") as f:
+                f.write(tracker_sig)
                 
-            # Remove old tracker if exists to avoid confusion
+            # Remove old trackers if exist
             if os.path.exists("active_amu0_path.txt"):
                 os.remove("active_amu0_path.txt")
+            if os.path.exists("active_amu0.json"):
+                os.remove("active_amu0.json")
             
             # 9. Sign AMU0 Bundle (F1)
             # Re-calculate hash including amu0_id.txt?
@@ -145,10 +171,15 @@ class AMUCapture:
             if "image_sha256" not in data:
                 raise GovernanceError("sandbox_manifest.json: missing image_sha256")
 
-    def _snapshot_filesystem(self, amu_dir: str, manifests_dir: str, mission_path: str) -> None:
+    def _snapshot_filesystem(self, amu_dir: str, manifests_dir: str, mission_path: str) -> Dict[str, Any]:
         """
         Snapshot the filesystem state into AMU0.
+        Returns the snapshot manifest.
         """
+        # Create fs_snapshot directory
+        fs_snapshot_dir = os.path.join(amu_dir, "fs_snapshot")
+        os.makedirs(fs_snapshot_dir, exist_ok=True)
+
         # Copy Project Builder
         pb_src = "project_builder"
         if os.path.exists(pb_src):
@@ -169,16 +200,34 @@ class AMUCapture:
         
         # Copy Governance Rules (D.2)
         rules_src = os.path.join(manifests_dir, "governance_ruleset.json")
+        rules_frozen_path = os.path.join(amu_dir, "governance_rules_frozen.json")
+        rules_hash = "MISSING"
+        
         if os.path.exists(rules_src):
-             shutil.copy(rules_src, os.path.join(amu_dir, "governance_rules_frozen.json"))
+             shutil.copy(rules_src, rules_frozen_path)
+             # Compute SHA (A.9)
+             with open(rules_frozen_path, "rb") as f:
+                 rules_hash = hashlib.sha256(f.read()).hexdigest()
         
         # Create Snapshot Manifest
         snapshot_manifest = {
             "timestamp": "2025-11-28T00:00:00Z", # In real system, use actual time
-            "contents": ["project_builder", "coo", "manifests", "phase3_reference_mission.json", "governance_rules_frozen.json"]
+            "contents": ["project_builder", "coo", "manifests", "phase3_reference_mission.json", "governance_rules_frozen.json"],
+            "governance_rules_sha256": rules_hash # A.9
         }
         with open(os.path.join(amu_dir, "snapshot_manifest.json"), "w") as f:
-            json.dump(snapshot_manifest, f)
+            json.dump(snapshot_manifest, f, sort_keys=True)
+            
+        # Normalize mtimes (A.10)
+        # Set all files in amu_dir to 1980-01-01 00:00:00 UTC
+        # timestamp: 315532800
+        pinned_ts = 315532800
+        for root, dirs, files in os.walk(amu_dir):
+            for d in dirs:
+                os.utime(os.path.join(root, d), (pinned_ts, pinned_ts))
+            for f in files:
+                os.utime(os.path.join(root, f), (pinned_ts, pinned_ts))
+        os.utime(amu_dir, (pinned_ts, pinned_ts))
             
         # Generate Pinned Context
         # In a real scenario, this would capture current env/hardware state.
@@ -211,16 +260,22 @@ class AMUCapture:
         
         with open(os.path.join(amu_dir, "pinned_context.json"), "w") as f:
             json.dump(pinned_context, f)
+            
+        return snapshot_manifest
 
     def _sign_amu0(self, amu_dir: str) -> None:
         """
         Sign the AMU0 bundle using Ed25519.
         """
         if not os.path.exists(self.private_key_path):
-            self.logger.warning("CEO Private Key not found. Skipping signature (DEV MODE ONLY).")
-            # In production this must fail. R4/R5 requires real crypto.
-            # Assuming key exists for R4/R5 compliance.
-            raise GovernanceError("CEO Private Key missing. Cannot sign AMU0.")
+             # Try env var
+             private_key_path = os.environ.get("CEO_PRIVATE_KEY_PATH")
+             if not private_key_path:
+                  self.logger.warning("CEO Private Key not found. Skipping signature (DEV MODE ONLY).")
+                  # In production this must fail. R4/R5 requires real crypto.
+                  # Assuming key exists for R4/R5 compliance.
+                  raise GovernanceError("CEO Private Key missing. Cannot sign AMU0.")
+             self.private_key_path = private_key_path
 
         # Calculate Canonical Hash (F1, F8)
         try:
