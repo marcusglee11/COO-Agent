@@ -9,6 +9,7 @@ from .state_machine import RuntimeFSM, RuntimeState, GovernanceError
 from ..util.context import enforce_pinned_context_or_fail
 from ..util.output_bundle import create_output_bundle
 from ..util import amu0_utils
+from ..util.subprocess import run_pinned_subprocess
 
 class ReplayEngine:
     """
@@ -91,16 +92,16 @@ class ReplayEngine:
         self.logger.info(f"Launching Replay Harness for {run_id}...")
         
         try:
-            # Run harness in subprocess with pinned environment (R6 B.2)
-            subprocess.run(
+            # R6.3 B5: Run harness with pinned subprocess
+            run_pinned_subprocess(
                 [sys.executable, harness_path, mission_path, output_dir, "--amu0", amu0_path, "--mode", mode],
+                amu0_path,
                 check=True,
-                env=env,
                 capture_output=True,
                 text=True
             )
-        except subprocess.CalledProcessError as e:
-            self.logger.error(f"Replay Harness Failed: {e.stdout}\n{e.stderr}")
+        except Exception as e:
+            self.logger.error(f"Replay Harness Failed: {e}")
             raise GovernanceError(f"Replay Execution Failed (Subprocess): {e}")
 
         return output_dir
