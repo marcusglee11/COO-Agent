@@ -9,6 +9,7 @@ from ..runtime.state_machine import RuntimeFSM, RuntimeState, GovernanceError
 from ..runtime.rollback import RollbackEngine
 from ..util.context import enforce_pinned_context_or_fail
 from ..util import amu0_utils
+from ..util.subprocess import run_pinned_subprocess
 
 class MigrationEngine:
     """
@@ -174,9 +175,10 @@ class MigrationEngine:
         if not os.path.exists(test_runner):
             raise GovernanceError("Test runner missing")
         try:
-             # R6 B.2: Use pinned environment
-             subprocess.run([sys.executable, test_runner], check=True, env=env)
-        except subprocess.CalledProcessError as e:
+             # R6.3 B5: Use pinned subprocess
+             amu0_path = amu0_utils.resolve_amu0_path()
+             run_pinned_subprocess([sys.executable, test_runner], amu0_path, check=True)
+        except Exception as e:
              raise GovernanceError(f"Tests Failed: {e}")
             
     def _delete_project_builder(self, pb_path: str) -> None:

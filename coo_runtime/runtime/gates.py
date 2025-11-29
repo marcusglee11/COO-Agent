@@ -10,6 +10,7 @@ from .lint_engine import LintEngine
 from .governance_leak_scanner import GovernanceLeakScanner
 from .replay import ReplayEngine
 from ..util import amu0_utils
+from ..util.subprocess import run_pinned_subprocess
 
 class GateKeeper:
     """
@@ -131,27 +132,30 @@ class GateKeeper:
               
         # F4: Query actual sandbox digest (R6 B.1)
         actual_sha = None
+        amu0_path = amu0_utils.resolve_amu0_path()
         
         # Try Docker
         try:
-            result = subprocess.run(
+            result = run_pinned_subprocess(
                 ["docker", "inspect", "--format='{{.Id}}'", "coo-sandbox"],
+                amu0_path,
                 capture_output=True,
                 text=True,
                 check=True
             )
             actual_sha = result.stdout.strip().replace("'", "")
-        except (subprocess.CalledProcessError, FileNotFoundError):
+        except Exception:
             # Try Podman
             try:
-                result = subprocess.run(
+                result = run_pinned_subprocess(
                     ["podman", "inspect", "--format='{{.Id}}'", "coo-sandbox"],
+                    amu0_path,
                     capture_output=True,
                     text=True,
                     check=True
                 )
                 actual_sha = result.stdout.strip().replace("'", "")
-            except (subprocess.CalledProcessError, FileNotFoundError):
+            except Exception:
                 pass
 
         if not actual_sha:
@@ -196,15 +200,13 @@ class GateKeeper:
         try:
             # R6 A.15: Subprocess Enforcement
             amu0_path = amu0_utils.resolve_amu0_path()
-            from ..util.context import enforce_pinned_context_or_fail
-            pinned_env = enforce_pinned_context_or_fail(amu0_path)
             
-            result = subprocess.run(
+            result = run_pinned_subprocess(
                 [sys.executable, test_runner_script], 
+                amu0_path,
                 check=True, 
                 capture_output=True, 
-                text=True,
-                env=pinned_env
+                text=True
             )
             self.logger.info("Test Suite Passed.")
         except subprocess.CalledProcessError as e:
