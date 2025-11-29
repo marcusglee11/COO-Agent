@@ -58,25 +58,40 @@ class RollbackLog:
         
         entries.append(entry)
         
-        # 5. Write Log
-        with open(log_path, "w") as f:
+        # 5. Write Log Atomically (R6.3 A6)
+        # Write to .tmp files first, then atomic rename
+        log_tmp = log_path + '.tmp'
+        sig_tmp = sig_path + '.tmp'
+        
+        # Write log to temporary file
+        with open(log_tmp, "w") as f:
             for e in entries:
                 f.write(json.dumps(e, sort_keys=True) + "\n")
                 
-        # 6. Sign Full Log (R6 A.2)
-        # We sign the bytes of the entire log file
-        with open(log_path, "rb") as f:
+        # 6. Sign Full Log (R6.3 A6)
+        # Sign the temporary log file
+        with open(log_tmp, "rb") as f:
             log_bytes = f.read()
             
         if not os.path.exists(self.private_key_path):
+            # Cleanup tmp file before failing
+            if os.path.exists(log_tmp):
+                os.remove(log_tmp)
             raise GovernanceError("CEO Private Key missing. Cannot sign rollback log.")
-            
-        signature = sign_bytes(self.private_key_path, log_bytes)
         
-        with open(sig_path, "wb") as f:
+        from ..util.crypto import Signature, get_ceo_private_key_path
+        signature = Signature.sign_data(log_bytes, get_ceo_private_key_path())
+        
+        # Write signature to temporary file
+        with open(sig_tmp, "wb") as f:
             f.write(signature)
+        
+        # 7. Atomic Rename (R6.3 A6)
+        # Both files written successfully, now rename atomically
+        os.rename(log_tmp, log_path)
+        os.rename(sig_tmp, sig_path)
             
-        self.logger.info(f"Appended rollback entry #{sequence_number}. Log re-signed.")
+        self.logger.info(f"Appended rollback entry #{sequence_number}. Log re-signed atomically.")
 
     def get_rollback_count(self, amu0_path: str) -> int:
         """

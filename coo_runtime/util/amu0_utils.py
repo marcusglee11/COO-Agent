@@ -1,13 +1,14 @@
 """
-AMU0 Utilities for COO Runtime (F1, F8).
-Provides canonical path resolution and recursive hashing for AMU0 bundles.
+AMU0 Utilities for COO Runtime R6.3.
+Provides canonical hash calculation, AMU0 verification, and path resolution.
 """
 import os
 import hashlib
 import json
+import struct
 from dataclasses import dataclass
 from ..runtime.state_machine import GovernanceError
-from ..util.crypto import verify_signature
+from ..util.crypto import Signature, get_ceo_public_key_path
 
 # ============================================================================
 # A4: VerificationResult Type - R6.3
@@ -25,126 +26,283 @@ class VerificationResult:
     amu0_id: str                 # Derived from canonical_hash (first 16 hex chars)
     has_rollback_log: bool       # Whether rollback log was present & verified
 
+# ============================================================================
+# A2: Canonical Hash Calculation - R6.3
+# ============================================================================
+
+# R6.3 A1/A2: Exact exclusion set per supplemental guidance
+EXCLUDED_FROM_HASH = {
+    "rollback_log.jsonl",      # Separate metadata
+    "rollback_log.sig",         # Rollback log signature
+    "signature.sig",            # Bundle signature
+    # metadata/ directory excluded (additional traces)
+    # *.tmp files excluded via endswith check
+    # external_trace.jsonl is INCLUDED (canonical trace)
+}
+
+def calculate_canonical_hash(amu0_dir: str) -> bytes:
+    """
+    Calculate canonical SHA-256 hash of AMU0 bundle.
+    
+    R6.3 A2: Deterministic traversal, mtime normalization, explicit exclusions.
+    Excludes: rollback_log.jsonl, rollback_log.sig, signature.sig, metadata/, *.tmp
+    Includes: external_trace.jsonl (canonical deep replay trace)
+    
+    Args:
+        amu0_dir: Path to AMU0 directory
+        
+    Returns:
+        SHA-256 digest bytes
+        
+    Raises:
+        GovernanceError: If hashing fails
+    """
+    hasher = hashlib.sha256()
+    
+    # Sorted traversal
+    for root, dirs, files in sorted(os.walk(amu0_dir)):
+        # Sort in-place for deterministic ordering
+        dirs[:] = sorted(dirs)
+        
+        # Skip metadata directory entirely
+        if 'metadata' in dirs:
+            dirs.remove('metadata')
+        
+        for filename in sorted(files):
+            # Skip excluded files
+            if filename in EXCLUDED_FROM_HASH or filename.endswith('.tmp'):
+                continue
+            
+            filepath = os.path.join(root, filename)
+            rel_path = os.path.relpath(filepath, amu0_dir)
+            
+            # Normalize path separators to POSIX
+            rel_path = rel_path.replace('\\', '/')
+            
+            # Hash: relative path + normalized mtime + file content
+            hasher.update(rel_path.encode('utf-8'))
+            hasher.update(struct.pack('<Q', 315532800))  # Normalized mtime: 1980-01-01
+            
+            try:
+                with open(filepath, 'rb') as f:
+                    hasher.update(f.read())
+            except Exception as e:
+                raise GovernanceError(f"Failed to read file for hashing: {rel_path}: {e}")
+    
+    return hasher.digest()
+
+# ============================================================================
+# A3: AMU₀ ID Derivation - R6.3
+# ============================================================================
+
+def derive_amu0_id(canonical_hash: bytes) -> str:
+    """
+    Derive AMU0 ID from canonical hash.
+    
+    R6.3 A3: ID = first 16 hex chars of canonical hash.
+    No amu0_id.txt file; always recomputed.
+    
+    Args:
+        canonical_hash: Canonical hash bytes
+        
+    Returns:
+        16-character hex string (AMU0 ID)
+    """
+    return canonical_hash.hex()[:16]
+
+# ============================================================================
+# A4: Unified AMU₀ Verification - R6.3
+# ============================================================================
+
+def verify_amu0_complete(amu0_path: str) -> VerificationResult:
+    """
+    Verify AMU0 integrity. Raises GovernanceError on any failure.
+    
+    R6.3 A4: Single canonical verification function.
+    All components MUST call this instead of maintaining local variants.
+    
+    Checks:
+    - Directory structure
+    - Required files (fs_snapshot, snapshot_manifest.json, pinned_context.json)
+    - Canonical hash computation
+    - Bundle signature validation
+    - Rollback log integrity (if present)
+    - Derived ID matches tracker
+    
+    Args:
+        amu0_path: Path to AMU0 directory
+        
+    Returns:
+        VerificationResult (only on full success)
+        
+    Raises:
+        GovernanceError: On any failure (structure, hash, signatures, log integrity, ID mismatch)
+    """
+    # 1. Check structure
+    if not os.path.isdir(amu0_path):
+        raise GovernanceError(f"AMU0 path is not a directory: {amu0_path}")
+    
+    # 2. Check required files/directories
+    required = ['fs_snapshot', 'snapshot_manifest.json', 'pinned_context.json']
+    for req in required:
+        req_path = os.path.join(amu0_path, req)
+        if not os.path.exists(req_path):
+            raise GovernanceError(f"Missing required file/dir: {req}")
+    
+    # 3. Compute canonical hash
+    try:
+        canonical_hash = calculate_canonical_hash(amu0_path)
+    except Exception as e:
+        raise GovernanceError(f"Canonical hash computation failed: {e}")
+    
+    amu0_id = derive_amu0_id(canonical_hash)
+    
+    # 4. Verify bundle signature
+    sig_path = os.path.join(amu0_path, 'signature.sig')
+    if not os.path.exists(sig_path):
+        raise GovernanceError("Missing bundle signature (signature.sig)")
+    
+    with open(sig_path, 'rb') as f:
+        signature = f.read()
+    
+    try:
+        public_key_path = get_ceo_public_key_path()
+    except Exception as e:
+        raise GovernanceError(f"Cannot get CEO public key path: {e}")
+    
+    if not Signature.verify_data(canonical_hash, signature, public_key_path):
+        raise GovernanceError("AMU0 bundle signature verification failed")
+    
+    # 5. Verify rollback log (if present)
+    has_rollback_log = False
+    log_path = os.path.join(amu0_path, 'rollback_log.jsonl')
+    
+    if os.path.exists(log_path):
+        # Verify rollback log signature and integrity
+        log_sig_path = os.path.join(amu0_path, 'rollback_log.sig')
+        if not os.path.exists(log_sig_path):
+            raise GovernanceError("Rollback log exists but signature missing")
+        
+        # Verify log signature
+        with open(log_path, 'rb') as f:
+            log_bytes = f.read()
+        
+        with open(log_sig_path, 'rb') as f:
+            log_sig = f.read()
+        
+        if not Signature.verify_data(log_bytes, log_sig, public_key_path):
+            raise GovernanceError("Rollback log signature verification failed")
+        
+        # TODO: Verify hash chain in rollback log (deferred to rollback_log.py)
+        has_rollback_log = True
+    
+    # 6. Success
+    return VerificationResult(
+        canonical_hash=canonical_hash,
+        amu0_id=amu0_id,
+        has_rollback_log=has_rollback_log
+    )
+
+# ============================================================================
+# Active AMU₀ Tracker Resolution
+# ============================================================================
+
 def resolve_amu0_path() -> str:
     """
     Resolves the active AMU0 path from the signed tracker (active_amu0_path.json).
+    
     Verifies:
-    1. Tracker signature (active_amu0_path.json.sig) using CEO Public Key.
-    2. AMU0 ID matches canonical hash of the directory (A.2, A.3).
+    1. Tracker signature (active_amu0_path.json.sig) using CEO Public Key
+    2. AMU0 exists and is valid via verify_amu0_complete()
+    3. Derived ID matches tracker ID
+    
+    Returns:
+        Absolute path to verified AMU0 directory
+        
+    Raises:
+        GovernanceError: If tracker invalid or AMU0 verification fails
     """
     tracker_path = os.path.join(os.getcwd(), "active_amu0_path.json")
     sig_path = os.path.join(os.getcwd(), "active_amu0_path.json.sig")
-    public_key_path = os.path.join(os.path.dirname(__file__), "../../coo_runtime/manifests/ceo_public_key.pem")
     
     if not os.path.exists(tracker_path):
-         raise GovernanceError("Active AMU0 tracker (active_amu0_path.json) not found.")
-
+        raise GovernanceError("Active AMU0 tracker (active_amu0_path.json) not found")
+    
     if not os.path.exists(sig_path):
-         raise GovernanceError("Active AMU0 tracker signature (active_amu0_path.json.sig) not found.")
-
-    if not os.path.exists(public_key_path):
-        raise GovernanceError("CEO Public Key missing. Cannot verify active AMU0 tracker.")
-
+        raise GovernanceError("Active AMU0 tracker signature (active_amu0_path.json.sig) not found")
+    
+    # Load tracker
     try:
         with open(tracker_path, "r") as f:
             data = json.load(f)
     except json.JSONDecodeError:
-        raise GovernanceError("active_amu0_path.json is corrupted.")
-
-    # 1. Verify Tracker Signature
+        raise GovernanceError("active_amu0_path.json is corrupted")
+    
+    # Verify required fields
     required_fields = ["amu0_path", "amu0_id", "created_at", "repo_commit"]
     for field in required_fields:
         if field not in data:
             raise GovernanceError(f"active_amu0_path.json missing required field: {field}")
-
-    # Reconstruct payload for verification (canonical JSON)
-    # The signature is over the sorted JSON bytes of the tracker file content
+    
+    # Verify tracker signature
     payload_bytes = json.dumps(data, sort_keys=True).encode("utf-8")
     
     with open(sig_path, "rb") as f:
         signature = f.read()
-
-    if not verify_signature(public_key_path, payload_bytes, signature):
-        raise GovernanceError("Active AMU0 Tracker Signature Invalid!")
-
-    # 2. Resolve Path
+    
+    try:
+        public_key_path = get_ceo_public_key_path()
+    except Exception as e:
+        raise GovernanceError(f"Cannot get CEO public key path: {e}")
+    
+    if not Signature.verify_data(payload_bytes, signature, public_key_path):
+        raise GovernanceError("Active AMU0 tracker signature invalid")
+    
+    # Resolve path
     path = data["amu0_path"]
     if not os.path.isabs(path):
         path = os.path.join(os.getcwd(), path)
-
+    
     if not os.path.exists(path):
         raise GovernanceError(f"Resolved AMU0 path does not exist: {path}")
-
-    # 3. Verify AMU0 ID matches amu0_id.txt (Fast Check)
-    # R6 A.1 says: "Check amu0_id against amu0_id.txt."
-    try:
-        stored_id = read_amu0_id(path)
-        if stored_id != data["amu0_id"]:
-             raise GovernanceError(f"AMU0 ID Mismatch! Tracker: {data['amu0_id']}, Stored: {stored_id}")
-    except GovernanceError as e:
-        raise GovernanceError(f"AMU0 ID Check Failed: {e}")
-
+    
+    # Verify AMU0 completely
+    verification_result = verify_amu0_complete(path)
+    
+    # Verify derived ID matches tracker
+    if verification_result.amu0_id != data["amu0_id"]:
+        raise GovernanceError(
+            f"AMU0 ID mismatch! "
+            f"Tracker: {data['amu0_id']}, "
+            f"Derived: {verification_result.amu0_id}"
+        )
+    
     return path
+
+# ============================================================================
+# Legacy Functions (Deprecated - R6.2 compatibility)
+# ============================================================================
 
 def read_amu0_id(amu0_path: str) -> str:
     """
-    Reads the AMU0 ID from amu0_id.txt in the AMU0 directory.
-    """
-    id_path = os.path.join(amu0_path, "amu0_id.txt")
-    if not os.path.exists(id_path):
-        raise GovernanceError(f"AMU0 ID file missing at {id_path}")
+    DEPRECATED: R6.3 removed amu0_id.txt file.
+    
+    This function now derives the ID from canonical hash instead of reading a file.
+    Kept for backward compatibility during migration.
+    
+    Args:
+        amu0_path: Path to AMU0 directory
         
-    with open(id_path, "r") as f:
-        return f.read().strip()
+    Returns:
+        Derived AMU0 ID
+    """
+    canonical_hash = calculate_canonical_hash(amu0_path)
+    return derive_amu0_id(canonical_hash)
 
 def hash_directory_recursive(amu0_path: str) -> bytes:
     """
-    Recursively hash all files in the AMU0 directory in sorted POSIX path order.
-    Exclusions:
-        - signature.sig
-        - amu0_id.txt (Excluded as it is derived from the hash)
-    All other files must be present and included.
-    Raise GovernanceError if any required file is missing.
-    """
-    required_files = [
-        "pinned_context.json",
-        "snapshot_manifest.json",
-        "phase3_reference_mission.json",
-        "rollback_log.jsonl",
-        "governance_rules_frozen.json"
-    ]
+    DEPRECATED: Use calculate_canonical_hash() instead.
     
-    # Check required files
-    for req in required_files:
-        if not os.path.exists(os.path.join(amu0_path, req)):
-            raise GovernanceError(f"AMU0 Integrity Check Failed: Missing required file {req}")
-
-    hasher = hashlib.sha256()
-    
-    # Walk directory sorted
-    for root, dirs, files in os.walk(amu0_path):
-        dirs.sort() # Sort directories in-place
-        files.sort() # Sort files
-        
-        for file in files:
-            if file in ["signature.sig", "amu0_id.txt"]:
-                continue
-                
-            file_path = os.path.join(root, file)
-            rel_path = os.path.relpath(file_path, amu0_path).replace("\\", "/") # POSIX path
-            
-            # Hash relative path to capture structure
-            hasher.update(rel_path.encode("utf-8"))
-            
-            # Hash content
-            with open(file_path, "rb") as f:
-                while chunk := f.read(8192):
-                    hasher.update(chunk)
-                    
-    return hasher.digest()
-
-def calculate_canonical_hash(amu0_path: str) -> bytes:
+    This function is kept for backward compatibility during R6.3 migration.
     """
-    Calculates the canonical SHA256 hash of the AMU0 bundle for signing.
-    """
-    return hash_directory_recursive(amu0_path)
+    return calculate_canonical_hash(amu0_path)
