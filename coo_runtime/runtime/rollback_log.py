@@ -86,8 +86,9 @@ class RollbackLog:
         
         # 7. Atomic Rename (R6.3 A6)
         # Both files written successfully, now rename atomically
-        os.rename(log_tmp, log_path)
-        os.rename(sig_tmp, sig_path)
+        # Use os.replace for Windows compatibility (atomic overwrite)
+        os.replace(log_tmp, log_path)
+        os.replace(sig_tmp, sig_path)
             
         self.logger.info(f"Appended rollback entry #{sequence_number}. Log re-signed atomically.")
 

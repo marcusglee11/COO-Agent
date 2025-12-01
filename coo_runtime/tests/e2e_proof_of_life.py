@@ -92,10 +92,18 @@ class TestE2EProofOfLife(unittest.TestCase):
         # We should probably run this test in self.test_dir.
         self.original_cwd = os.getcwd()
         os.chdir(self.test_dir)
+        self.addCleanup(os.chdir, self.original_cwd)
         
         # Capture AMU0
-        with unittest.mock.patch("coo_runtime.util.crypto.sign_bytes", return_value=b"mock_sig"):
-             capture.capture_amu0("manifests", "phase3_reference_mission.json")
+        # Mock crypto globally for the test duration
+        self.sign_patcher = unittest.mock.patch("coo_runtime.util.crypto.Signature.sign_data", return_value=b"mock_sig")
+        self.verify_patcher = unittest.mock.patch("coo_runtime.util.crypto.Signature.verify_data", return_value=True)
+        self.sign_patcher.start()
+        self.verify_patcher.start()
+        self.addCleanup(self.sign_patcher.stop)
+        self.addCleanup(self.verify_patcher.stop)
+        
+        capture.capture_amu0("manifests", "phase3_reference_mission.json")
 
         self.amu_dir = None
         if os.path.exists("active_amu0_path.json"):
@@ -103,11 +111,10 @@ class TestE2EProofOfLife(unittest.TestCase):
                 data = json.load(f)
                 self.amu_dir = data.get("amu0_path")
 
-    @unittest.mock.patch("coo_runtime.util.context.enforce_pinned_context_or_fail", return_value={})
-    @unittest.mock.patch("coo_runtime.runtime.replay.enforce_pinned_context_or_fail", return_value={})
-    @unittest.mock.patch("coo_runtime.runtime.migration.enforce_pinned_context_or_fail", return_value={})
+    @unittest.mock.patch("coo_runtime.runtime.migration.initialize_runtime")
+    @unittest.mock.patch("coo_runtime.runtime.replay.initialize_runtime")
     @unittest.mock.patch("coo_runtime.util.context._verify_hardware_context")
-    def test_full_migration_success(self, mock_hw, mock_ctx_mig, mock_ctx_rep, mock_ctx_gate):
+    def test_full_migration_success(self, mock_hw, mock_init_rep, mock_init_mig):
         print("\n--- Testing Full Migration Success (R3) ---")
         
         fsm = RuntimeFSM()
@@ -155,9 +162,8 @@ class TestE2EProofOfLife(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.amu_dir, "snapshot_manifest.json")))
         self.assertTrue(os.path.exists(os.path.join(self.amu_dir, "signature.sig")))
 
-    @unittest.mock.patch("coo_runtime.runtime.rollback.enforce_pinned_context_or_fail", return_value={})
     @unittest.mock.patch("coo_runtime.util.context._verify_hardware_context")
-    def test_rollback_snapshot_corruption(self, mock_hw, mock_ctx_rb):
+    def test_rollback_snapshot_corruption(self, mock_hw):
         print("\n--- Testing Rollback Snapshot Corruption (R3) ---")
         
         fsm = RuntimeFSM()
@@ -169,9 +175,9 @@ class TestE2EProofOfLife(unittest.TestCase):
         print("\n--- Testing Strict Mode Enforcement (R3) ---")
         # ...
 
-    @unittest.mock.patch("coo_runtime.runtime.replay.enforce_pinned_context_or_fail", return_value={})
+    @unittest.mock.patch("coo_runtime.runtime.replay.initialize_runtime")
     @unittest.mock.patch("coo_runtime.util.context._verify_hardware_context")
-    def test_replay_failure_nondeterminism(self, mock_hw, mock_ctx_rep):
+    def test_replay_failure_nondeterminism(self, mock_hw, mock_init):
         print("\n--- Testing Replay Failure (Nondeterminism) ---")
         
         fsm = RuntimeFSM()
@@ -184,7 +190,7 @@ class TestE2EProofOfLife(unittest.TestCase):
         # Mock _run_mission
         # We need to mock it to return two different directories
         
-        def mock_run(mission_path, run_id, env, amu0_path, mode):
+        def mock_run(mission_path, run_id, amu0_path, mode):
             out_dir = f"replay_output_{run_id}"
             os.makedirs(out_dir, exist_ok=True)
             with open(os.path.join(out_dir, "mission.db"), "w") as f:
@@ -222,5 +228,4 @@ if __name__ == "__main__":
     unittest.main()
 
 
-if __name__ == "__main__":
-    unittest.main()
+

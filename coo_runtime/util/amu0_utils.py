@@ -184,7 +184,7 @@ def verify_amu0_complete(amu0_path: str) -> VerificationResult:
             log_bytes = f.read()
         
         with open(log_sig_path, 'rb') as f:
-            log_sig = f.read()
+             log_sig = f.read()
         
         if not Signature.verify_data(log_bytes, log_sig):
             raise GovernanceError("Rollback log signature verification failed")

@@ -69,6 +69,33 @@ def _get_public_key() -> VerifyKey:
         raise CryptoError("Keys not loaded. Call initialize_runtime() first.")
     return _CEO_PUBLIC_KEY
 
+def sign_bytes(message: bytes) -> bytes:
+    """
+    Deterministically sign the given message bytes using the CEO private key
+    defined by the existing manifests / key-management model.
+
+    - Pure function from (message, key) -> signature bytes
+    - No randomness, no timestamps
+    - No file path parameters; key is loaded from the canonical location once
+    """
+    try:
+        sk = _get_private_key()
+        return sk.sign(message).signature
+    except Exception as e:
+        raise CryptoError(f"Signing failed: {e}") from e
+
+def verify_bytes(message: bytes, signature: bytes) -> bool:
+    """
+    Verify a signature produced by sign_bytes for the given message.
+    Deterministic, side-effect free.
+    """
+    try:
+        vk = _get_public_key()
+        vk.verify(message, signature)
+        return True
+    except (BadSignatureError, Exception):
+        return False
+
 # ============================================================================
 # D2: Unified Signature Protocol - R6.3 / R6.5
 # ============================================================================
@@ -100,11 +127,7 @@ class Signature:
         if private_key_path is not None:
             raise CryptoError("R6.5 G2 Violation: Passing key paths to sign_data is forbidden.")
             
-        try:
-            sk = _get_private_key()
-            return sk.sign(data).signature
-        except Exception as e:
-            raise CryptoError(f"Signing failed: {e}") from e
+        return sign_bytes(data)
     
     @staticmethod
     def verify_data(data: bytes, signature: bytes, public_key_path: str = None) -> bool:
@@ -122,12 +145,7 @@ class Signature:
         if public_key_path is not None:
             raise CryptoError("R6.5 G2 Violation: Passing key paths to verify_data is forbidden.")
             
-        try:
-            vk = _get_public_key()
-            vk.verify(data, signature)
-            return True
-        except (BadSignatureError, Exception):
-            return False
+        return verify_bytes(data, signature)
     
     @staticmethod
     def sign_file(filepath: str, private_key_path: str = None) -> bytes:

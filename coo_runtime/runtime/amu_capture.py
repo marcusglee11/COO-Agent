@@ -53,8 +53,16 @@ class AMUCapture:
             
             # 4. Initialize Rollback Log (A.1)
             # Empty log file
-            with open(os.path.join(temp_dir, "rollback_log.jsonl"), "w") as f:
+            log_path = os.path.join(temp_dir, "rollback_log.jsonl")
+            with open(log_path, "w") as f:
                 pass
+            
+            # Sign the empty rollback log (R6.5 C2)
+            log_sig = Signature.sign_file(log_path)
+            sig_path = os.path.join(temp_dir, "rollback_log.sig")
+            with open(sig_path, "wb") as f:
+                f.write(log_sig)
+            print(f"DEBUG: Created rollback log signature at {sig_path}")
             
             # 5. Verify Hygiene (R6.5 A3)
             self._verify_amu0_temp_hygiene(temp_dir)
