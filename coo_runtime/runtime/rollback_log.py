@@ -4,7 +4,10 @@ import hashlib
 import logging
 from typing import Dict, Any, List
 from ..runtime.state_machine import GovernanceError
-from ..util.crypto import sign_bytes, verify_signature
+from ..util.questions import raise_question, QuestionType
+from ..util.crypto import Signature
+
+MAX_ROLLBACK_ENTRIES = 1000 # R6.5 C2: Bounded log
 
 class RollbackLog:
     """
@@ -15,9 +18,7 @@ class RollbackLog:
     - Full re-signing on append
     """
 
-    def __init__(self, private_key_path: str, public_key_path: str):
-        self.private_key_path = private_key_path
-        self.public_key_path = public_key_path
+    def __init__(self):
         self.logger = logging.getLogger("RollbackLog")
 
     def append_entry(self, amu0_path: str, payload: Dict[str, Any]) -> None:
@@ -29,6 +30,10 @@ class RollbackLog:
         
         # 1. Load existing log to get previous hash
         entries = self._load_and_verify_log(amu0_path)
+        
+        # R6.5 C2: Fail-closed on full
+        if len(entries) >= MAX_ROLLBACK_ENTRIES:
+             raise_question(QuestionType.ROLLBACK_INTEGRITY, f"Rollback log full (max {MAX_ROLLBACK_ENTRIES}). Fail-closed.")
         
         if entries:
             last_entry = entries[-1]
@@ -73,14 +78,7 @@ class RollbackLog:
         with open(log_tmp, "rb") as f:
             log_bytes = f.read()
             
-        if not os.path.exists(self.private_key_path):
-            # Cleanup tmp file before failing
-            if os.path.exists(log_tmp):
-                os.remove(log_tmp)
-            raise GovernanceError("CEO Private Key missing. Cannot sign rollback log.")
-        
-        from ..util.crypto import Signature, get_ceo_private_key_path
-        signature = Signature.sign_data(log_bytes, get_ceo_private_key_path())
+        signature = Signature.sign_data(log_bytes)
         
         # Write signature to temporary file
         with open(sig_tmp, "wb") as f:
@@ -115,20 +113,17 @@ class RollbackLog:
             
         # 1. Verify Signature
         if os.path.exists(sig_path):
-            if not os.path.exists(self.public_key_path):
-                raise GovernanceError("CEO Public Key missing. Cannot verify rollback log.")
-                
             with open(log_path, "rb") as f:
                 log_bytes = f.read()
             with open(sig_path, "rb") as f:
                 signature = f.read()
                 
-            if not verify_signature(self.public_key_path, log_bytes, signature):
-                raise GovernanceError("Rollback Log Signature Invalid!")
+            if not Signature.verify_data(log_bytes, signature):
+                raise_question(QuestionType.ROLLBACK_INTEGRITY, "Rollback Log Signature Invalid!")
         else:
             # If no signature, log must be empty (fresh capture)
             if os.path.getsize(log_path) > 0:
-                 raise GovernanceError("Rollback log has content but no signature.")
+                 raise_question(QuestionType.ROLLBACK_INTEGRITY, "Rollback log has content but no signature.")
         
         # 2. Parse Entries
         entries = []
@@ -146,7 +141,7 @@ class RollbackLog:
                 
             # Check Previous Hash
             if entry["previous_hash"] != expected_prev_hash:
-                raise GovernanceError(f"Rollback Log Hash Chain Broken at #{i+1}")
+                raise_question(QuestionType.ROLLBACK_INTEGRITY, f"Rollback Log Hash Chain Broken at #{i+1}")
                 
             # Re-calculate Entry Hash
             stored_hash = entry["entry_hash"]
@@ -158,7 +153,7 @@ class RollbackLog:
             calculated_hash = hashlib.sha256(entry_bytes).hexdigest()
             
             if calculated_hash != stored_hash:
-                 raise GovernanceError(f"Rollback Log Entry Hash Mismatch at #{i+1}")
+                 raise_question(QuestionType.ROLLBACK_INTEGRITY, f"Rollback Log Entry Hash Mismatch at #{i+1}")
                  
             expected_prev_hash = stored_hash
             

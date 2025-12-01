@@ -8,7 +8,8 @@ import json
 import struct
 from dataclasses import dataclass
 from ..runtime.state_machine import GovernanceError
-from ..util.crypto import Signature, get_ceo_public_key_path
+from ..util.crypto import Signature
+from ..util.questions import raise_question, QuestionType
 
 # ============================================================================
 # A4: VerificationResult Type - R6.3
@@ -69,7 +70,7 @@ def calculate_canonical_hash(amu0_dir: str) -> bytes:
             dirs.remove('metadata')
         
         for filename in sorted(files):
-            # Skip excluded files
+            # R6.4 A2: Skip excluded files (including ALL *.tmp files)
             if filename in EXCLUDED_FROM_HASH or filename.endswith('.tmp'):
                 continue
             
@@ -165,12 +166,7 @@ def verify_amu0_complete(amu0_path: str) -> VerificationResult:
     with open(sig_path, 'rb') as f:
         signature = f.read()
     
-    try:
-        public_key_path = get_ceo_public_key_path()
-    except Exception as e:
-        raise GovernanceError(f"Cannot get CEO public key path: {e}")
-    
-    if not Signature.verify_data(canonical_hash, signature, public_key_path):
+    if not Signature.verify_data(canonical_hash, signature):
         raise GovernanceError("AMU0 bundle signature verification failed")
     
     # 5. Verify rollback log (if present)
@@ -190,7 +186,7 @@ def verify_amu0_complete(amu0_path: str) -> VerificationResult:
         with open(log_sig_path, 'rb') as f:
             log_sig = f.read()
         
-        if not Signature.verify_data(log_bytes, log_sig, public_key_path):
+        if not Signature.verify_data(log_bytes, log_sig):
             raise GovernanceError("Rollback log signature verification failed")
         
         # TODO: Verify hash chain in rollback log (deferred to rollback_log.py)
@@ -229,20 +225,20 @@ def resolve_amu0_path() -> str:
         raise GovernanceError("Active AMU0 tracker (active_amu0_path.json) not found")
     
     if not os.path.exists(sig_path):
-        raise GovernanceError("Active AMU0 tracker signature (active_amu0_path.json.sig) not found")
+        raise_question(QuestionType.ROLLBACK_INTEGRITY, "Active AMU0 tracker signature (active_amu0_path.json.sig) not found")
     
     # Load tracker
     try:
         with open(tracker_path, "r") as f:
             data = json.load(f)
     except json.JSONDecodeError:
-        raise GovernanceError("active_amu0_path.json is corrupted")
+        raise_question(QuestionType.ROLLBACK_INTEGRITY, "active_amu0_path.json is corrupted")
     
     # Verify required fields
     required_fields = ["amu0_path", "amu0_id", "created_at", "repo_commit"]
     for field in required_fields:
         if field not in data:
-            raise GovernanceError(f"active_amu0_path.json missing required field: {field}")
+            raise_question(QuestionType.ROLLBACK_INTEGRITY, f"active_amu0_path.json missing required field: {field}")
     
     # Verify tracker signature
     payload_bytes = json.dumps(data, sort_keys=True).encode("utf-8")
@@ -250,13 +246,8 @@ def resolve_amu0_path() -> str:
     with open(sig_path, "rb") as f:
         signature = f.read()
     
-    try:
-        public_key_path = get_ceo_public_key_path()
-    except Exception as e:
-        raise GovernanceError(f"Cannot get CEO public key path: {e}")
-    
-    if not Signature.verify_data(payload_bytes, signature, public_key_path):
-        raise GovernanceError("Active AMU0 tracker signature invalid")
+    if not Signature.verify_data(payload_bytes, signature):
+        raise_question(QuestionType.ROLLBACK_INTEGRITY, "Active AMU0 tracker signature invalid")
     
     # Resolve path
     path = data["amu0_path"]
@@ -271,10 +262,9 @@ def resolve_amu0_path() -> str:
     
     # Verify derived ID matches tracker
     if verification_result.amu0_id != data["amu0_id"]:
-        raise GovernanceError(
-            f"AMU0 ID mismatch! "
-            f"Tracker: {data['amu0_id']}, "
-            f"Derived: {verification_result.amu0_id}"
+        raise_question(
+            QuestionType.ROLLBACK_INTEGRITY,
+            f"AMU0 ID mismatch! Tracker: {data['amu0_id']}, Derived: {verification_result.amu0_id}"
         )
     
     return path

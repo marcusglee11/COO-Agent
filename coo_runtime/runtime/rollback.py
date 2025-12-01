@@ -4,8 +4,8 @@ import shutil
 import logging
 from typing import Optional, Dict, Any
 from ..runtime.state_machine import RuntimeFSM, RuntimeState, GovernanceError
-from ..util.crypto import verify_signature
-from ..util.context import enforce_pinned_context_or_fail
+from ..util.crypto import Signature
+from ..runtime.init import initialize_runtime
 from ..util import amu0_utils
 from .rollback_log import RollbackLog
 
@@ -23,12 +23,7 @@ class RollbackEngine:
     def __init__(self, fsm: RuntimeFSM):
         self.fsm = fsm
         self.logger = logging.getLogger("RollbackEngine")
-        # CEO Public Key Path
-        self.public_key_path = os.path.join(os.path.dirname(__file__), "../../coo_runtime/manifests/ceo_public_key.pem")
-        # CEO Private Key Path (for signing rollback log) - In prod this would be separate or HSM
-        self.private_key_path = os.path.join(os.path.dirname(__file__), "../../coo_runtime/manifests/ceo_private_key.pem")
-        
-        self.rollback_log = RollbackLog(self.private_key_path, self.public_key_path)
+        self.rollback_log = RollbackLog()
 
     def execute_rollback(self) -> None:
         """
@@ -74,12 +69,12 @@ class RollbackEngine:
             self.fsm.transition_to(RuntimeState.ERROR)
             raise e
 
-        # 6. Enforce Pinned Context (F9)
+        # R6.4 E1: Use initialize_runtime instead of deprecated enforce_pinned_context_or_fail
         # Must happen after restore to ensure environment is reset to pinned state
         try:
-            enforce_pinned_context_or_fail(amu0_path)
+            initialize_runtime(amu0_path)
         except GovernanceError as e:
-            self.logger.critical(f"Post-Rollback Context Enforcement Failed: {e}")
+            self.logger.critical(f"Post-Rollback Initialization Failed: {e}")
             self.fsm.transition_to(RuntimeState.ERROR)
             raise e
 
@@ -90,28 +85,15 @@ class RollbackEngine:
 
     def _verify_amu0_signature(self, amu0_path: str) -> None:
         """
+        R6.4 A1: Use canonical AMU₀ verification instead of local logic.
         Verifies the Ed25519 signature of the AMU0 bundle.
         """
-        if not os.path.exists(self.public_key_path):
-             # In production, this is fatal.
-             raise GovernanceError("CEO Public Key missing. Cannot verify AMU0.")
-
-        sig_path = os.path.join(amu0_path, "signature.sig")
-        if not os.path.exists(sig_path):
-            raise GovernanceError("AMU0 Signature missing.")
-
-        with open(sig_path, "rb") as f:
-            signature = f.read()
-
-        # Calculate Canonical Hash (F1, F8)
+        # R6.4 A1: Single canonical verification entry point
         try:
-            canonical_hash = amu0_utils.calculate_canonical_hash(amu0_path)
+            verification_result = amu0_utils.verify_amu0_complete(amu0_path)
+            self.logger.info(f"AMU₀ verification complete. ID: {verification_result.amu0_id}")
         except GovernanceError as e:
-             raise GovernanceError(f"AMU0 Verification Failed (Hashing): {e}")
-
-        # Verify
-        if not verify_signature(self.public_key_path, canonical_hash, signature):
-            raise GovernanceError("AMU0 Signature Verification Failed! Bundle may be tampered.")
+            raise GovernanceError(f"AMU₀ verification failed: {e}")
 
     def _restore_from_amu0(self, amu0_path: str) -> None:
         """

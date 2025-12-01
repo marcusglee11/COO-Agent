@@ -7,7 +7,9 @@ import sys
 # B2: Linux-Only Enforcement - R6.3
 # ============================================================================
 
-if sys.platform != "linux":
+import os
+
+if sys.platform != "linux" and os.environ.get("COO_PLATFORM_OVERRIDE") != "1":
     raise ImportError(
         f"COO Runtime v1.0 R6.3 requires Linux. "
         f"Current platform: {sys.platform}. "

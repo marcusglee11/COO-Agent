@@ -7,9 +7,11 @@ import sys
 from typing import List, Optional
 from ..runtime.state_machine import RuntimeFSM, RuntimeState, GovernanceError
 from ..runtime.rollback import RollbackEngine
-from ..util.context import enforce_pinned_context_or_fail
+from ..runtime.init import initialize_runtime
+from ..util import amu0_utils
 from ..util import amu0_utils
 from ..util.subprocess import run_pinned_subprocess
+from ..util.questions import raise_question, QuestionType
 
 class MigrationEngine:
     """
@@ -28,10 +30,10 @@ class MigrationEngine:
         self.fsm.assert_state(RuntimeState.MIGRATION_SEQUENCE)
 
         try:
-            # 0. Enforce Pinned Context (F2, R6 B.2)
+            # R6.4 E1: Initialize runtime instead of deprecated enforce_pinned_context_or_fail
             # Resolve AMU0 path first (F8)
             amu0_path = amu0_utils.resolve_amu0_path()
-            pinned_env = enforce_pinned_context_or_fail(amu0_path)
+            initialize_runtime(amu0_path)
             
             # 1. Create COO Tree
             self._create_coo_tree(coo_path)
@@ -43,10 +45,13 @@ class MigrationEngine:
             self._update_imports(coo_path)
             
             # 4. Run Tests
-            self._run_tests(test_runner, pinned_env)
+            self._run_tests(test_runner)
             
             # 5. Delete Project Builder
             self._delete_project_builder(pb_path)
+            
+            # 6. Run Tests (Snapshot B) - R6.5 Hygiene Fix
+            self._run_tests(test_runner)
             
             self.logger.info("Migration Phase 1 Complete.")
             
@@ -121,7 +126,7 @@ class MigrationEngine:
                 # Detect dynamic imports/execution (A.6)
                 if isinstance(node.func, ast.Name):
                     if node.func.id in ["__import__", "eval", "exec"]:
-                        raise GovernanceError(f"Migration Failed: Forbidden dynamic execution '{node.func.id}' detected.")
+                        raise_question(QuestionType.MIGRATION_FAILURE, f"Migration Failed: Forbidden dynamic execution '{node.func.id}' detected.")
                 return node
 
         for root, _, files in os.walk(coo_path):
@@ -135,7 +140,7 @@ class MigrationEngine:
                     try:
                         tree = ast.parse(source, filename=path)
                     except SyntaxError:
-                        raise GovernanceError(f"Migration Failed: Syntax Error in {file}")
+                        raise_question(QuestionType.MIGRATION_FAILURE, f"Migration Failed: Syntax Error in {file}")
 
                     # 1. Check for forbidden patterns (importlib)
                     # We do this by walking before transform or during.
@@ -144,10 +149,10 @@ class MigrationEngine:
                         if isinstance(node, ast.Import):
                             for alias in node.names:
                                 if alias.name == "importlib" or alias.name.startswith("importlib."):
-                                     raise GovernanceError(f"Migration Failed: Forbidden 'importlib' usage in {file}")
+                                     raise_question(QuestionType.MIGRATION_FAILURE, f"Migration Failed: Forbidden 'importlib' usage in {file}")
                         elif isinstance(node, ast.ImportFrom):
                             if node.module and (node.module == "importlib" or node.module.startswith("importlib.")):
-                                 raise GovernanceError(f"Migration Failed: Forbidden 'importlib' usage in {file}")
+                                 raise_question(QuestionType.MIGRATION_FAILURE, f"Migration Failed: Forbidden 'importlib' usage in {file}")
 
                     # 2. Transform
                     transformer = ImportTransformer()
@@ -155,12 +160,12 @@ class MigrationEngine:
                         new_tree = transformer.visit(tree)
                         ast.fix_missing_locations(new_tree)
                     except GovernanceError as e:
-                        raise GovernanceError(f"Migration Failed in {file}: {e}")
+                        raise_question(QuestionType.MIGRATION_FAILURE, f"Migration Failed in {file}: {e}")
 
                     # 3. Unparse (Pure AST)
                     # Requires Python 3.9+
                     if sys.version_info < (3, 9):
-                        raise GovernanceError("COO Runtime requires Python 3.9+ for AST unparsing.")
+                        raise_question(QuestionType.MIGRATION_FAILURE, "COO Runtime requires Python 3.9+ for AST unparsing.")
                         
                     new_source = ast.unparse(new_tree)
                     
@@ -168,18 +173,18 @@ class MigrationEngine:
                     with open(path, "w", encoding="utf-8") as f:
                         f.write(new_source)
 
-    def _run_tests(self, test_runner: str, env: dict) -> None:
+    def _run_tests(self, test_runner: str) -> None:
         # Execute test runner
         # In production, use subprocess.check_call
         # Here we assume it passes if file exists
         if not os.path.exists(test_runner):
-            raise GovernanceError("Test runner missing")
+            raise_question(QuestionType.MIGRATION_FAILURE, "Test runner missing")
         try:
              # R6.3 B5: Use pinned subprocess
              amu0_path = amu0_utils.resolve_amu0_path()
              run_pinned_subprocess([sys.executable, test_runner], amu0_path, check=True)
         except Exception as e:
-             raise GovernanceError(f"Tests Failed: {e}")
+             raise_question(QuestionType.MIGRATION_FAILURE, f"Tests Failed: {e}")
             
     def _delete_project_builder(self, pb_path: str) -> None:
         if os.path.exists(pb_path):

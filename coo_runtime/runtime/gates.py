@@ -11,6 +11,7 @@ from .governance_leak_scanner import GovernanceLeakScanner
 from .replay import ReplayEngine
 from ..util import amu0_utils
 from ..util.subprocess import run_pinned_subprocess
+from ..util.questions import raise_question, QuestionType
 
 class GateKeeper:
     """
@@ -71,12 +72,12 @@ class GateKeeper:
         
         # Verify 'coo' directory exists and has expected structure
         if not os.path.exists(coo_root):
-            raise GovernanceError("Gate A Failed: 'coo' directory missing.")
+            raise_question(QuestionType.GATE_FAILURE, "Gate A Failed: 'coo' directory missing.")
         
         required_subdirs = ["runtime", "orchestrator", "sandbox"]
         for subdir in required_subdirs:
             if not os.path.exists(os.path.join(coo_root, subdir)):
-                raise GovernanceError(f"Gate A Failed: Missing required subdirectory '{subdir}' in 'coo'.")
+                raise_question(QuestionType.GATE_FAILURE, f"Gate A Failed: Missing required subdirectory '{subdir}' in 'coo'.")
 
     def _gate_b_deterministic_modules(self, coo_root: str):
         """Gate B — Deterministic Modules & Security Checks (R6 D.2)"""
@@ -102,16 +103,16 @@ class GateKeeper:
                                 if isinstance(node, ast.Import):
                                     for alias in node.names:
                                         if alias.name in forbidden_imports:
-                                            raise GovernanceError(f"Gate B Failed: Forbidden import '{alias.name}' in {file}")
+                                            raise_question(QuestionType.MODE_VIOLATION, f"Gate B Failed: Forbidden import '{alias.name}' in {file}")
                                 elif isinstance(node, ast.ImportFrom):
                                     if node.module in forbidden_imports:
-                                        raise GovernanceError(f"Gate B Failed: Forbidden import from '{node.module}' in {file}")
+                                        raise_question(QuestionType.MODE_VIOLATION, f"Gate B Failed: Forbidden import from '{node.module}' in {file}")
                                 
                                 # Check Dynamic Execution (D.2)
                                 elif isinstance(node, ast.Call):
                                     if isinstance(node.func, ast.Name):
                                         if node.func.id in forbidden_functions:
-                                            raise GovernanceError(f"Gate B Failed: Forbidden function call '{node.func.id}' in {file}")
+                                            raise_question(QuestionType.MODE_VIOLATION, f"Gate B Failed: Forbidden function call '{node.func.id}' in {file}")
                         except SyntaxError:
                             pass # Should be caught by lint
 
@@ -121,14 +122,14 @@ class GateKeeper:
         
         manifest_path = os.path.join(manifests_dir, "sandbox_manifest.json")
         if not os.path.exists(manifest_path):
-             raise GovernanceError("Gate D Failed: Sandbox manifest missing.")
+             raise_question(QuestionType.SANDBOX_SECURITY, "Gate D Failed: Sandbox manifest missing.")
              
         with open(manifest_path, "r") as f:
             manifest = json.load(f)
             
         expected_sha = manifest.get("image_sha256")
         if not expected_sha or expected_sha == "SHA256_PLACEHOLDER":
-              raise GovernanceError("Gate D Failed: Invalid SHA256 in manifest.")
+              raise_question(QuestionType.SANDBOX_SECURITY, "Gate D Failed: Invalid SHA256 in manifest.")
               
         # F4: Query actual sandbox digest (R6 B.1)
         actual_sha = None
@@ -160,7 +161,7 @@ class GateKeeper:
 
         if not actual_sha:
             # Fail Closed (A.5)
-            raise GovernanceError("Gate D Failed: OCI Runtime (Docker/Podman) unavailable or 'coo-sandbox' image not found.")
+            raise_question(QuestionType.SANDBOX_SECURITY, "Gate D Failed: OCI Runtime (Docker/Podman) unavailable or 'coo-sandbox' image not found.")
 
         # Normalize SHA
         if actual_sha.startswith("sha256:"):
@@ -169,7 +170,7 @@ class GateKeeper:
             expected_sha = expected_sha[7:]
 
         if actual_sha != expected_sha:
-            raise GovernanceError(f"Gate D Failed: Sandbox SHA mismatch. Expected: {expected_sha}, Actual: {actual_sha}")
+            raise_question(QuestionType.SANDBOX_SECURITY, f"Gate D Failed: Sandbox SHA mismatch. Expected: {expected_sha}, Actual: {actual_sha}")
 
     def _gate_c_test_suite_integrity(self, test_runner_script: str, manifests_dir: str = None):
         """Gate C — Test Suite Integrity (A.11)"""
@@ -188,13 +189,13 @@ class GateKeeper:
                         actual_sha = hashlib.sha256(f.read()).hexdigest()
                     
                     if actual_sha != expected_sha:
-                        raise GovernanceError(f"Gate C Failed: Test Runner SHA mismatch. Expected: {expected_sha}, Actual: {actual_sha}")
+                        raise_question(QuestionType.GATE_FAILURE, f"Gate C Failed: Test Runner SHA mismatch. Expected: {expected_sha}, Actual: {actual_sha}")
                 else:
-                    raise GovernanceError("Gate C Failed: test_runner_sha256 missing in test_manifest.json")
+                    raise_question(QuestionType.GATE_FAILURE, "Gate C Failed: test_runner_sha256 missing in test_manifest.json")
             else:
-                 raise GovernanceError("Gate C Failed: test_manifest.json missing.")
+                 raise_question(QuestionType.GATE_FAILURE, "Gate C Failed: test_manifest.json missing.")
         else:
-            raise GovernanceError("Gate C Failed: manifests_dir not provided for verification.")
+            raise_question(QuestionType.GATE_FAILURE, "Gate C Failed: manifests_dir not provided for verification.")
 
         # Run the full test suite and fail on ANY error.
         try:
@@ -211,7 +212,7 @@ class GateKeeper:
             self.logger.info("Test Suite Passed.")
         except subprocess.CalledProcessError as e:
             self.logger.error(f"Test Suite Output: {e.stdout}\n{e.stderr}")
-            raise GovernanceError(f"Gate C Failed: Test suite failed with exit code {e.returncode}")
+            raise_question(QuestionType.GATE_FAILURE, f"Gate C Failed: Test suite failed with exit code {e.returncode}")
 
     def _gate_e_governance_integrity(self, coo_root: str, manifests_dir: str):
         """Gate E — Governance Integrity (R6 D.1)"""
@@ -231,24 +232,24 @@ class GateKeeper:
             snapshot_manifest_path = os.path.join(amu0_path, "snapshot_manifest.json")
             
             if not os.path.exists(ruleset_path):
-                 raise GovernanceError(f"Gate E Failed: Frozen ruleset missing at {ruleset_path}")
+                 raise_question(QuestionType.GATE_FAILURE, f"Gate E Failed: Frozen ruleset missing at {ruleset_path}")
                  
             if not os.path.exists(snapshot_manifest_path):
-                 raise GovernanceError("Gate E Failed: Snapshot manifest missing in AMU0.")
+                 raise_question(QuestionType.GATE_FAILURE, "Gate E Failed: Snapshot manifest missing in AMU0.")
                  
             with open(snapshot_manifest_path, "r") as f:
                 snapshot_manifest = json.load(f)
                 
             expected_hash = snapshot_manifest.get("governance_rules_sha256")
             if not expected_hash:
-                 raise GovernanceError("Gate E Failed: governance_rules_sha256 missing in snapshot manifest.")
+                 raise_question(QuestionType.GATE_FAILURE, "Gate E Failed: governance_rules_sha256 missing in snapshot manifest.")
                  
             # Compute Hash
             with open(ruleset_path, "rb") as f:
                 actual_hash = hashlib.sha256(f.read()).hexdigest()
                 
             if actual_hash != expected_hash:
-                 raise GovernanceError(f"Gate E Failed: Frozen ruleset hash mismatch. Expected: {expected_hash}, Actual: {actual_hash}")
+                 raise_question(QuestionType.GATE_FAILURE, f"Gate E Failed: Frozen ruleset hash mismatch. Expected: {expected_hash}, Actual: {actual_hash}")
                  
         except GovernanceError as e:
             # Fallback only allowed if strictly dev mode and explicitly requested?
@@ -289,11 +290,11 @@ class GateKeeper:
         try:
             amu0_path = amu0_utils.resolve_amu0_path()
         except GovernanceError as e:
-             raise GovernanceError(f"Gate F Failed: {e}")
+             raise_question(QuestionType.GATE_FAILURE, f"Gate F Failed: {e}")
 
         mission_path = os.path.join(amu0_path, "phase3_reference_mission.json")
         
         if not os.path.exists(mission_path):
-             raise GovernanceError("Gate F Failed: Reference mission not found in AMU0.")
+             raise_question(QuestionType.GATE_FAILURE, "Gate F Failed: Reference mission not found in AMU0.")
              
         self.replay_engine.execute_replay(mission_path, amu0_path)

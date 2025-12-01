@@ -6,10 +6,11 @@ import shutil
 import json
 import subprocess
 from .state_machine import RuntimeFSM, RuntimeState, GovernanceError
-from ..util.context import enforce_pinned_context_or_fail
+from ..runtime.init import initialize_runtime
 from ..util.output_bundle import create_output_bundle
 from ..util import amu0_utils
 from ..util.subprocess import run_pinned_subprocess
+from ..util.questions import raise_question, QuestionType
 
 class ReplayEngine:
     """
@@ -37,23 +38,23 @@ class ReplayEngine:
         # 1. Verify Reference Mission SHA
         self._verify_reference_mission(mission_path, amu0_path)
 
-        # 2. Enforce Pinned Context (F2, R6 B.2)
-        # We must enforce the environment captured in AMU0.
-        self.logger.info("Enforcing Pinned Context from AMU0...")
-        pinned_env = enforce_pinned_context_or_fail(amu0_path)
+        # R6.4 E1: Initialize runtime with AMU0 pinned context
+        # Replaces deprecated enforce_pinned_context_or_fail
+        self.logger.info("Initializing runtime with AMU0 pinned context...")
+        initialize_runtime(amu0_path)
 
         # 3. Run 1
         self.logger.info("Replay Run 1...")
-        output1 = self._run_mission(mission_path, "run1", pinned_env, amu0_path, mode)
+        output1 = self._run_mission(mission_path, "run1", amu0_path, mode)
 
         # 4. Run 2
         self.logger.info("Replay Run 2...")
-        output2 = self._run_mission(mission_path, "run2", pinned_env, amu0_path, mode)
+        output2 = self._run_mission(mission_path, "run2", amu0_path, mode)
 
         # 5. Compare (F7)
         self.logger.info("Comparing Outputs (Byte-for-Byte)...")
         if not self._compare_outputs(output1, output2):
-             raise GovernanceError("Deterministic Replay Failed: Outputs do not match byte-for-byte.")
+             raise_question(QuestionType.REPLAY_VERIFICATION, "Deterministic Replay Failed: Outputs do not match byte-for-byte.")
 
         self.logger.info("Deterministic Replay Passed.")
 
@@ -69,15 +70,15 @@ class ReplayEngine:
         # For now, we assume we compare against the file in AMU0
         amu_mission_path = os.path.join(amu0_path, "phase3_reference_mission.json")
         if not os.path.exists(amu_mission_path):
-            raise GovernanceError("AMU0 missing reference mission copy")
+            raise_question(QuestionType.AMU0_INTEGRITY, "AMU0 missing reference mission copy")
             
         with open(amu_mission_path, "rb") as f:
             amu_sha = hashlib.sha256(f.read()).hexdigest()
             
         if current_sha != amu_sha:
-            raise GovernanceError("Replay Mission Mismatch: SHA256 does not match AMU0 locked version.")
+            raise_question(QuestionType.REPLAY_VERIFICATION, "Replay Mission Mismatch: SHA256 does not match AMU0 locked version.")
 
-    def _run_mission(self, mission_path: str, run_id: str, env: dict, amu0_path: str, mode: str) -> str:
+    def _run_mission(self, mission_path: str, run_id: str, amu0_path: str, mode: str) -> str:
         """
         Runs the mission in the locked context using the Replay Harness subprocess.
         Returns path to output directory.
@@ -87,7 +88,7 @@ class ReplayEngine:
         # Harness script path
         harness_path = os.path.join(os.path.dirname(__file__), "replay_harness.py")
         if not os.path.exists(harness_path):
-            raise GovernanceError(f"Replay Harness missing at {harness_path}")
+            raise_question(QuestionType.GATE_FAILURE, f"Replay Harness missing at {harness_path}")
 
         self.logger.info(f"Launching Replay Harness for {run_id}...")
         
@@ -102,7 +103,7 @@ class ReplayEngine:
             )
         except Exception as e:
             self.logger.error(f"Replay Harness Failed: {e}")
-            raise GovernanceError(f"Replay Execution Failed (Subprocess): {e}")
+            raise_question(QuestionType.REPLAY_VERIFICATION, f"Replay Execution Failed (Subprocess): {e}")
 
         return output_dir
 

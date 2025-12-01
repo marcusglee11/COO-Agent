@@ -67,26 +67,20 @@ def initialize_runtime(amu0_path: str) -> None:
     from ..util.context import _verify_hardware_context
     _verify_hardware_context(context)
     
-    # 3. Seed RNG
+    # 3. Load Keys (R6.5 G2)
+    from ..util.crypto import load_keys
+    load_keys()
+    
+    # 4. Seed RNG
     rng_seed = context.get('rng_seed', 'DETERMINISTIC_SEED_DEFAULT')
     random.seed(rng_seed)
     
     # 4. Verify time pinning (if configured)
     mock_time = context.get('mock_time')
     if mock_time:
-        # Build env for verification
-        pinned_env = {}
-        pinned_env['PATH'] = "/usr/bin:/bin"
-        for k, v in context.get('env_vars', {}).items():
-            pinned_env[k] = str(v)
-        
-        libfaketime_enabled = context.get('libfaketime_enabled', False)
-        if libfaketime_enabled:
-            pinned_env['LD_PRELOAD'] = '/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1'
-            pinned_env['FAKETIME'] = mock_time
-            
             # Verify time pinning
-            _verify_time_pinning(pinned_env, mock_time)
+            # R6.5 F2: Pass amu0_path, let run_pinned_subprocess handle env
+            _verify_time_pinning(amu0_path, mock_time)
     
     # 5. Mark as initialized
     _initialized_amu0_path = amu0_path

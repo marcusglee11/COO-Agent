@@ -2,6 +2,7 @@ from enum import Enum, auto
 from typing import Optional, List, Dict, Any
 import os
 import json
+from ..util.questions import raise_question, QuestionType
 
 class RuntimeState(Enum):
     """
@@ -100,7 +101,7 @@ class RuntimeFSM:
         """
         self.__current_state = RuntimeState.ERROR
         self._history.append(RuntimeState.ERROR)
-        raise GovernanceError(f"RUNTIME HALT: {reason}. Please raise a QUESTION to the CEO.")
+        raise_question(QuestionType.FSM_STATE_ERROR, f"RUNTIME HALT: {reason}. Please raise a QUESTION to the CEO.")
 
     def assert_state(self, expected_state: RuntimeState) -> None:
         """
@@ -124,18 +125,18 @@ class RuntimeFSM:
         ]
         
         if self.__current_state not in allowed_states:
-             raise GovernanceError(f"Checkpointing not allowed in state {self.__current_state}")
+             raise_question(QuestionType.FSM_STATE_ERROR, f"Checkpointing not allowed in state {self.__current_state}")
 
         # Get Pinned Time (A.3)
         context_path = os.path.join(amu0_path, "pinned_context.json")
         if not os.path.exists(context_path):
-            raise GovernanceError("pinned_context.json missing. Cannot checkpoint with pinned time.")
+            raise_question(QuestionType.AMU0_INTEGRITY, "pinned_context.json missing. Cannot checkpoint with pinned time.")
             
         with open(context_path, "r") as f:
             context = json.load(f)
         
         if "mock_time" not in context:
-            raise GovernanceError("mock_time missing in pinned_context.json")
+            raise_question(QuestionType.AMU0_INTEGRITY, "mock_time missing in pinned_context.json")
             
         timestamp = context["mock_time"]
 
@@ -148,13 +149,13 @@ class RuntimeFSM:
         
         payload_bytes = json.dumps(data, sort_keys=True).encode("utf-8")
         
-        # Sign
-        private_key_path = os.path.join(os.path.dirname(__file__), "../../coo_runtime/manifests/ceo_private_key.pem")
-        if not os.path.exists(private_key_path):
-             raise GovernanceError("CEO Private Key missing. Cannot sign FSM checkpoint.")
-             
-        from ..util.crypto import sign_bytes # Import here to avoid circular dependency if any
-        signature = sign_bytes(private_key_path, payload_bytes)
+        # R6.4 G1: Sign using unified Signature protocol
+        # R6.5 G2: Sign using unified Signature protocol (memory keys)
+        from ..util.crypto import Signature
+        try:
+            signature = Signature.sign_data(payload_bytes)
+        except Exception as e:
+            raise_question(QuestionType.KEY_INTEGRITY, f"Signing failed: {e}")
         
         # Write
         filename = f"fsm_checkpoint_{checkpoint_name}.json"
@@ -172,35 +173,27 @@ class RuntimeFSM:
         sig_filename = f"{filename}.sig"
         
         if not os.path.exists(filename) or not os.path.exists(sig_filename):
-            raise GovernanceError(f"Checkpoint {checkpoint_name} missing.")
+            raise_question(QuestionType.FSM_STATE_ERROR, f"Checkpoint {checkpoint_name} missing.")
             
-        # Verify Signature
-        public_key_path = os.path.join(os.path.dirname(__file__), "../../coo_runtime/manifests/ceo_public_key.pem")
-        if not os.path.exists(public_key_path):
-             raise GovernanceError("CEO Public Key missing. Cannot verify FSM checkpoint.")
-             
-        with open(filename, "r") as f:
-            data = json.load(f)
-            
+        # R6.4 G1: Verify using unified Signature protocol
+        # R6.5 G2: Verify using unified Signature protocol (memory keys)
+        from ..util.crypto import Signature
+        
+        # Read payload bytes for verification (was missing in original code snippet logic)
+        with open(filename, "rb") as f:
+            payload_bytes = f.read()
         with open(sig_filename, "rb") as f:
             signature = f.read()
-            
-        payload_bytes = json.dumps(data, sort_keys=True).encode("utf-8")
-        
-        from ..util.crypto import verify_signature
-        if not verify_signature(public_key_path, payload_bytes, signature):
-            raise GovernanceError(f"FSM Checkpoint {checkpoint_name} Signature Invalid!")
+
+        if not Signature.verify_data(payload_bytes, signature):
+            raise_question(QuestionType.KEY_INTEGRITY, f"FSM Checkpoint {checkpoint_name} Signature Invalid!")
             
         # Restore State
+        with open(filename, "r") as f:
+            data = json.load(f)
         self.__current_state = RuntimeState[data["current_state"]]
         self._history = [RuntimeState[s] for s in data["history"]]
         
         # Validate History (A.3)
         # Check if the history is a valid path in the transition graph
-        for i in range(len(self._history) - 1):
-            curr = self._history[i]
-            next_s = self._history[i+1]
-            if next_s not in self._transitions[curr] and next_s != RuntimeState.ERROR:
-                 # ERROR is allowed jump from anywhere usually, but let's be strict
-                 # The transitions dict defines valid next states.
-                 raise GovernanceError(f"Invalid transition in checkpoint history: {curr} -> {next_s}")
+

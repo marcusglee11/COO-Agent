@@ -6,8 +6,9 @@ import logging
 import hashlib
 from typing import Optional, Dict, Any
 from ..runtime.state_machine import GovernanceError
-from ..util.crypto import Signature, get_ceo_private_key_path, create_signature_metadata
+from ..util.crypto import Signature, create_signature_metadata
 from ..util import amu0_utils
+from ..util.questions import raise_question, QuestionType
 from ..util.context import capture_hardware_context
 from ..util.subprocess import run_pinned_subprocess
 
@@ -55,18 +56,24 @@ class AMUCapture:
             with open(os.path.join(temp_dir, "rollback_log.jsonl"), "w") as f:
                 pass
             
-            # 5. Calculate Canonical Hash & Derive ID (A.3)
-            # We exclude signature.sig and amu0_id.txt (not yet created)
-            # We must include rollback_log.jsonl (empty)
+            # 5. Verify Hygiene (R6.5 A3)
+            self._verify_amu0_temp_hygiene(temp_dir)
+
+            # 6. Calculate Canonical Hash & Derive ID (A.3)
             try:
                 canonical_hash = amu0_utils.calculate_canonical_hash(temp_dir)
             except GovernanceError as e:
                 raise GovernanceError(f"AMU0 Hashing Failed: {e}")
                 
-            # R6.3 A3: Derive ID from hash (no amu0_id.txt file)
             amu0_id = amu0_utils.derive_amu0_id(canonical_hash)
             
-            # 6. Rename to Final AMU0 Directory
+            # 7. Sign AMU0 Bundle in Temp (R6.5 A3)
+            # Sign using unified Signature protocol (memory keys)
+            signature = Signature.sign_data(canonical_hash)
+            with open(os.path.join(temp_dir, "signature.sig"), "wb") as f:
+                f.write(signature)
+            
+            # 8. Rename to Final AMU0 Directory (Atomic Promotion)
             amu_dir_name = f"amu0_{amu0_id}"
             amu_dir = os.path.abspath(amu_dir_name)
             
@@ -77,10 +84,14 @@ class AMUCapture:
             os.rename(temp_dir, amu_dir)
             self.logger.info(f"Created AMU0 directory: {amu_dir}")
             
-            # 7. R6.3 A3: NO amu0_id.txt file - ID is derived from hash only
-            # (removed file creation)
-                
-            # 8. Persist Active AMU0 Path (A.1 - Signed Tracker)
+            # 9. Post-Promotion Verification (R6.5 A3)
+            # Verify hash matches what we signed
+            final_hash = amu0_utils.calculate_canonical_hash(amu_dir)
+            if final_hash != canonical_hash:
+                raise_question(QuestionType.AMU0_INTEGRITY, "Post-promotion canonical hash mismatch!")
+
+            # 10. Persist Active AMU0 Path (A.1 - Signed Tracker)
+            # ... (rest of tracker logic)
             # Get current git commit using pinned subprocess
             try:
                 result = run_pinned_subprocess(
@@ -113,12 +124,11 @@ class AMUCapture:
             # Sign the payload (R6.3 D2: Unified Signature Protocol)
             tracker_bytes = json.dumps(tracker_payload, sort_keys=True).encode("utf-8")
             
+            # R6.5 G2: Use memory-resident keys (no path resolution)
             try:
-                private_key_path = get_ceo_private_key_path()
+                tracker_sig = Signature.sign_data(tracker_bytes)
             except Exception as e:
-                raise GovernanceError(f"Cannot get CEO private key: {e}")
-
-            tracker_sig = Signature.sign_data(tracker_bytes, private_key_path)
+                raise GovernanceError(f"Signing failed: {e}")
             
             # Write Tracker JSON
             with open("active_amu0_path.json", "w") as f:
@@ -134,11 +144,8 @@ class AMUCapture:
             if os.path.exists("active_amu0.json"):
                 os.remove("active_amu0.json")
             
-            # 9. Sign AMU0 Bundle (F1)
-            # Re-calculate hash including amu0_id.txt?
-            # R6 says "All AMU0 artefacts... must be included".
-            # So we should re-hash.
-            self._sign_amu0(amu_dir)
+            # 9. Sign AMU0 Bundle (F1) - MOVED TO STEP 7 (Before Rename)
+            # self._sign_amu0(amu_dir) -> Removed, done in temp
             
             self.logger.info(f"AMU0 Capture Complete. ID: {amu0_id}")
             return amu_dir
@@ -176,6 +183,25 @@ class AMUCapture:
                     
             if "image_sha256" not in data:
                 raise GovernanceError("sandbox_manifest.json: missing image_sha256")
+
+    def _verify_amu0_temp_hygiene(self, temp_dir: str) -> None:
+        """
+        R6.5 A3: Verify AMU0 hygiene before promotion.
+        No symlinks, no .tmp files, no metadata files.
+        """
+        for root, dirs, files in os.walk(temp_dir):
+            for d in dirs:
+                path = os.path.join(root, d)
+                if os.path.islink(path):
+                     raise_question(QuestionType.AMU0_INTEGRITY, f"Symlink detected in AMU0: {path}")
+            for f in files:
+                path = os.path.join(root, f)
+                if os.path.islink(path):
+                     raise_question(QuestionType.AMU0_INTEGRITY, f"Symlink detected in AMU0: {path}")
+                if f.endswith(".tmp"):
+                     raise_question(QuestionType.AMU0_INTEGRITY, f"Temporary file detected in AMU0: {path}")
+                if f in ["amu0_id.txt", "signature.sig"]:
+                     raise_question(QuestionType.AMU0_INTEGRITY, f"Metadata file {f} found prematurely in AMU0")
 
     def _snapshot_filesystem(self, amu_dir: str, manifests_dir: str, mission_path: str) -> Dict[str, Any]:
         """
@@ -215,10 +241,35 @@ class AMUCapture:
              with open(rules_frozen_path, "rb") as f:
                  rules_hash = hashlib.sha256(f.read()).hexdigest()
         
+        # Capture External Trace (R6.5 A4)
+        trace_src = os.path.join(manifests_dir, "external_trace.jsonl")
+        trace_dest = os.path.join(amu_dir, "external_trace.jsonl")
+        if os.path.exists(trace_src):
+            # Canonicalize (Sort by prompt_hash)
+            entries = []
+            with open(trace_src, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        try:
+                            entries.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            raise GovernanceError("Invalid JSON in external_trace.jsonl")
+            
+            # Sort deterministically by prompt_hash
+            entries.sort(key=lambda x: x.get("prompt_hash", ""))
+            
+            with open(trace_dest, "w", encoding="utf-8") as f:
+                for entry in entries:
+                    f.write(json.dumps(entry, sort_keys=True) + "\n")
+        else:
+            # Optional? If missing, Deep Replay won't work.
+            # But we don't fail capture.
+            pass
+        
         # Create Snapshot Manifest
         snapshot_manifest = {
             "timestamp": "2025-11-28T00:00:00Z", # In real system, use actual time
-            "contents": ["project_builder", "coo", "manifests", "phase3_reference_mission.json", "governance_rules_frozen.json"],
+            "contents": ["project_builder", "coo", "manifests", "phase3_reference_mission.json", "governance_rules_frozen.json", "external_trace.jsonl"],
             "governance_rules_sha256": rules_hash # A.9
         }
         with open(os.path.join(amu_dir, "snapshot_manifest.json"), "w") as f:
@@ -275,29 +326,4 @@ class AMUCapture:
             
         return snapshot_manifest
 
-    def _sign_amu0(self, amu_dir: str) -> None:
-        """
-        Sign the AMU0 bundle using Ed25519.
-        """
-        if not os.path.exists(self.private_key_path):
-             # Try env var
-             private_key_path = os.environ.get("CEO_PRIVATE_KEY_PATH")
-             if not private_key_path:
-                  self.logger.warning("CEO Private Key not found. Skipping signature (DEV MODE ONLY).")
-                  # In production this must fail. R4/R5 requires real crypto.
-                  # Assuming key exists for R4/R5 compliance.
-                  raise GovernanceError("CEO Private Key missing. Cannot sign AMU0.")
-             self.private_key_path = private_key_path
 
-        # Calculate Canonical Hash (F1, F8)
-        try:
-            canonical_hash = amu0_utils.calculate_canonical_hash(amu_dir)
-        except GovernanceError as e:
-            raise GovernanceError(f"AMU0 Hashing Failed: {e}")
-
-        # Sign Hash
-        signature = sign_bytes(self.private_key_path, canonical_hash)
-        
-        # Write Signature
-        with open(os.path.join(amu_dir, "signature.sig"), "wb") as f:
-            f.write(signature)

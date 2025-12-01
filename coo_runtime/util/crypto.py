@@ -1,11 +1,12 @@
 """
 Cryptographic utilities for COO Runtime.
 Implements Ed25519 signing and verification per R6.3 Unified Signature Protocol.
+R6.5 G2: Enforces memory-resident keys and rejects key paths in API.
 """
 import os
 import hashlib
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from nacl.signing import VerifyKey, SigningKey
 from nacl.exceptions import BadSignatureError
 
@@ -14,139 +15,143 @@ class CryptoError(Exception):
     pass
 
 # ============================================================================
-# D1: Canonical Key Resolution (No Fallbacks) - R6.3
+# G2: Memory-Resident Key Management - R6.5
 # ============================================================================
 
-def get_ceo_private_key_path() -> str:
-    """
-    Get CEO private key path from environment variable.
-    Raises CryptoError if not set or file doesn't exist.
-    
-    R6.3 D1: Keys MUST ONLY be specified via environment variables.
-    No repository paths. No fallback search order. Fail-closed.
-    """
-    path = os.environ.get('CEO_PRIVATE_KEY_PATH')
-    if not path:
-        raise CryptoError(
-            "CEO_PRIVATE_KEY_PATH environment variable not set. "
-            "Cannot perform signing operations."
-        )
-    if not os.path.exists(path):
-        raise CryptoError(
-            f"CEO private key not found at {path}"
-        )
-    return path
+_CEO_PRIVATE_KEY: Optional[SigningKey] = None
+_CEO_PUBLIC_KEY: Optional[VerifyKey] = None
 
-def get_ceo_public_key_path() -> str:
+def load_keys() -> None:
     """
-    Get CEO public key path from environment variable.
-    Raises CryptoError if not set or file doesn't exist.
+    Load keys from environment paths into memory.
+    MUST be called exactly once during initialization.
     
-    R6.3 D1: Keys MUST ONLY be specified via environment variables.
-    No repository paths. No fallback search order. Fail-closed.
+    R6.5 G2: Keys are loaded into memory-only structures.
+    Path resolution happens ONLY here.
     """
-    path = os.environ.get('CEO_PUBLIC_KEY_PATH')
-    if not path:
-        raise CryptoError(
-            "CEO_PUBLIC_KEY_PATH environment variable not set. "
-            "Cannot perform verification operations."
-        )
-    if not os.path.exists(path):
-        raise CryptoError(
-            f"CEO public key not found at {path}"
-        )
-    return path
+    global _CEO_PRIVATE_KEY, _CEO_PUBLIC_KEY
+    
+    # Load Private Key
+    priv_path = os.environ.get('CEO_PRIVATE_KEY_PATH')
+    if not priv_path:
+        raise CryptoError("CEO_PRIVATE_KEY_PATH not set.")
+    if not os.path.exists(priv_path):
+        raise CryptoError(f"CEO private key not found at {priv_path}")
+        
+    try:
+        with open(priv_path, 'rb') as f:
+            _CEO_PRIVATE_KEY = SigningKey(f.read())
+    except Exception as e:
+        raise CryptoError(f"Failed to load private key: {e}")
+
+    # Load Public Key
+    pub_path = os.environ.get('CEO_PUBLIC_KEY_PATH')
+    if not pub_path:
+        raise CryptoError("CEO_PUBLIC_KEY_PATH not set.")
+    if not os.path.exists(pub_path):
+        raise CryptoError(f"CEO public key not found at {pub_path}")
+        
+    try:
+        with open(pub_path, 'rb') as f:
+            _CEO_PUBLIC_KEY = VerifyKey(f.read())
+    except Exception as e:
+        raise CryptoError(f"Failed to load public key: {e}")
+
+def _get_private_key() -> SigningKey:
+    """Internal accessor for private key."""
+    if _CEO_PRIVATE_KEY is None:
+        raise CryptoError("Keys not loaded. Call initialize_runtime() first.")
+    return _CEO_PRIVATE_KEY
+
+def _get_public_key() -> VerifyKey:
+    """Internal accessor for public key."""
+    if _CEO_PUBLIC_KEY is None:
+        raise CryptoError("Keys not loaded. Call initialize_runtime() first.")
+    return _CEO_PUBLIC_KEY
 
 # ============================================================================
-# D2: Unified Signature Protocol - R6.3
+# D2: Unified Signature Protocol - R6.3 / R6.5
 # ============================================================================
 
 class Signature:
     """
     Unified signature protocol for all COO Runtime signing operations.
     
-    R6.3 D2: ALL signing and verification (AMU₀, rollback, checkpoints, gates)
-    MUST use this unified protocol.
+    R6.5 G2: 
+    - Uses memory-resident keys ONLY.
+    - Rejects path arguments.
     """
     
     @staticmethod
-    def sign_data(data: bytes, private_key_path: str) -> bytes:
+    def sign_data(data: bytes, private_key_path: str = None) -> bytes:
         """
-        Sign arbitrary bytes. Returns raw signature bytes.
+        Sign arbitrary bytes using loaded private key.
         
         Args:
             data: Bytes to sign
-            private_key_path: Path to Ed25519 private key
+            private_key_path: FORBIDDEN in R6.5. Must be None.
             
         Returns:
             Raw signature bytes
             
         Raises:
-            CryptoError: If signing fails
+            CryptoError: If signing fails or path provided
         """
+        if private_key_path is not None:
+            raise CryptoError("R6.5 G2 Violation: Passing key paths to sign_data is forbidden.")
+            
         try:
-            with open(private_key_path, 'rb') as f:
-                sk = SigningKey(f.read())
+            sk = _get_private_key()
             return sk.sign(data).signature
         except Exception as e:
             raise CryptoError(f"Signing failed: {e}") from e
     
     @staticmethod
-    def verify_data(data: bytes, signature: bytes, public_key_path: str) -> bool:
+    def verify_data(data: bytes, signature: bytes, public_key_path: str = None) -> bool:
         """
-        Verify signature over bytes.
+        Verify signature over bytes using loaded public key.
         
         Args:
             data: Original data that was signed
             signature: Signature bytes to verify
-            public_key_path: Path to Ed25519 public key
+            public_key_path: FORBIDDEN in R6.5. Must be None.
             
         Returns:
             True on successful verification, False on failure
         """
+        if public_key_path is not None:
+            raise CryptoError("R6.5 G2 Violation: Passing key paths to verify_data is forbidden.")
+            
         try:
-            with open(public_key_path, 'rb') as f:
-                vk = VerifyKey(f.read())
+            vk = _get_public_key()
             vk.verify(data, signature)
             return True
         except (BadSignatureError, Exception):
             return False
     
     @staticmethod
-    def sign_file(filepath: str, private_key_path: str) -> bytes:
+    def sign_file(filepath: str, private_key_path: str = None) -> bytes:
         """
         Read file contents and sign them.
-        
-        Args:
-            filepath: Path to file to sign
-            private_key_path: Path to Ed25519 private key
-            
-        Returns:
-            Signature bytes
-            
-        Note:
-            Caller is responsible for writing signature to <filepath>.sig if desired.
         """
+        if private_key_path is not None:
+             raise CryptoError("R6.5 G2 Violation: Passing key paths to sign_file is forbidden.")
+             
         with open(filepath, 'rb') as f:
             data = f.read()
-        return Signature.sign_data(data, private_key_path)
+        return Signature.sign_data(data)
     
     @staticmethod
-    def verify_file(filepath: str, signature: bytes, public_key_path: str) -> bool:
+    def verify_file(filepath: str, signature: bytes, public_key_path: str = None) -> bool:
         """
         Read file contents and verify signature bytes.
-        
-        Args:
-            filepath: Path to file that was signed
-            signature: Signature bytes to verify
-            public_key_path: Path to Ed25519 public key
-            
-        Returns:
-            True on successful verification, False on failure
         """
+        if public_key_path is not None:
+             raise CryptoError("R6.5 G2 Violation: Passing key paths to verify_file is forbidden.")
+
         with open(filepath, 'rb') as f:
             data = f.read()
-        return Signature.verify_data(data, signature, public_key_path)
+        return Signature.verify_data(data, signature)
 
 # ============================================================================
 # Dev/Prod Mode Support (Supplemental R6.3 Guidance)
@@ -155,51 +160,36 @@ class Signature:
 def create_signature_metadata(mode: str = None) -> Dict[str, Any]:
     """
     Create signature metadata with mode information.
-    
-    Supplemental R6.3: All signatures must include mode information to
-    mechanically fence development from production.
-    
-    Args:
-        mode: "dev" or "prod" (defaults to COO_MODE env var or "dev")
-        
-    Returns:
-        Dict with mode, timestamp, key_id
     """
     if mode is None:
         mode = os.environ.get("COO_MODE", "dev")
     
     try:
-        public_key_path = get_ceo_public_key_path()
-        with open(public_key_path, 'rb') as f:
-            key_bytes = f.read()
+        # Use memory key for ID generation
+        vk = _get_public_key()
+        key_bytes = vk.encode()
         key_id = hashlib.sha256(key_bytes).hexdigest()[:8]
     except CryptoError:
         key_id = "UNKNOWN"
     
+    # R6.5 Hygiene Fix: Use pinned time source
+    from ..runtime.init import get_initialized_amu0_path
+    from ..util.context import get_pinned_time
+    
+    amu0_path = get_initialized_amu0_path()
+    if amu0_path:
+        try:
+            timestamp = get_pinned_time(amu0_path).isoformat() + "Z"
+        except Exception:
+             # Fallback if pinned time fails (should not happen if initialized)
+             timestamp = datetime.utcnow().isoformat() + "Z"
+    else:
+        # Fallback if runtime not initialized (e.g. unit tests or early boot)
+        # But for deterministic operations, this should be initialized.
+        timestamp = datetime.utcnow().isoformat() + "Z"
+
     return {
         "mode": mode,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": timestamp,
         "key_id": key_id
     }
-
-# ============================================================================
-# Legacy Functions (Deprecated - Use Signature class instead)
-# ============================================================================
-
-def sign_bytes(private_key_path: str = None, data: bytes = None) -> bytes:
-    """
-    DEPRECATED: Use Signature.sign_data() instead.
-    Legacy function for backward compatibility during migration.
-    """
-    if not private_key_path:
-        private_key_path = get_ceo_private_key_path()
-    return Signature.sign_data(data, private_key_path)
-
-def verify_signature(public_key_path: str = None, data: bytes = None, signature: bytes = None) -> bool:
-    """
-    DEPRECATED: Use Signature.verify_data() instead.
-    Legacy function for backward compatibility during migration.
-    """
-    if not public_key_path:
-        public_key_path = get_ceo_public_key_path()
-    return Signature.verify_data(data, signature, public_key_path)
