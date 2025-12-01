@@ -1,6 +1,7 @@
 import asyncio
 import uuid
 import base64
+import json
 from typing import Dict, List, Optional
 from pathlib import Path
 import structlog
@@ -274,3 +275,96 @@ class Orchestrator:
                 (message_id,),
             )
             await db.commit()
+
+    async def run_mission(self, mission_id: str):
+        """Run a specific mission to completion (blocking)."""
+        mission = await self.store.get_mission(mission_id)
+        if not mission:
+            raise ValueError(f"Mission {mission_id} not found")
+
+        # Parse config to check type
+        mission_type = "UNKNOWN"
+        mission_config = {}
+        if mission.get("config_json"):
+            try:
+                mission_config = json.loads(mission["config_json"])
+                mission_type = mission_config.get("mission_type", "UNKNOWN")
+            except:
+                pass
+
+        if mission_type == "DEMO_V1_1":
+            await self._run_demo_mission(mission, mission_config)
+        else:
+            raise NotImplementedError("Only DEMO_V1_1 missions are supported in run_mission for now.")
+
+    async def _run_demo_mission(self, mission: Dict, config: Dict):
+        """Execute deterministic demo mission logic."""
+        import datetime
+        
+        mission_id = mission["id"]
+        
+        # Fixed Demo Content
+        DEMO_SUMMARY_SOURCE_TEXT = (
+            "The Agentic Compute Engine (ACE) is a distributed runtime environment designed to execute "
+            "autonomous software agents in a secure, deterministic manner. Unlike traditional container "
+            "orchestration systems, ACE enforces strict causality tracking through a cryptographic ledger "
+            "known as the Mission Log. Every state transition, external API call, and resource modification "
+            "is signed and sequenced, allowing for perfect replayability of any agent session. The system "
+            "architecture separates the 'Planner' (LLM-based reasoning core) from the 'Executor' (sandboxed "
+            "tool runner), ensuring that AI hallucinations cannot directly corrupt the host environment. "
+            "ACE is built on a capability-based security model, where agents must explicitly request "
+            "permissions for network access or filesystem writes, which are then granted or denied by a "
+            "deterministic policy engine."
+        )
+        
+        DEMO_SUMMARY_PROMPT = (
+            "You are helping demonstrate a deterministic runtime.\n"
+            "Summarise the following text in one short paragraph:\n\n"
+            f"{DEMO_SUMMARY_SOURCE_TEXT}"
+        )
+        
+        # Start
+        await self.store.update_mission_status(mission_id, "RUNNING")
+        await self.store.log_timeline_event(mission_id, "INIT", {"mission_type": "DEMO_V1_1"})
+        
+        try:
+            messages = [
+                {"role": "user", "content": DEMO_SUMMARY_PROMPT}
+            ]
+            
+            # Log MODEL_REQUEST
+            await self.store.log_timeline_event(mission_id, "MODEL_REQUEST", {
+                "model": "default", # Or resolved model name if available
+                "prompt_kind": "demo_summary_v1"
+            })
+            
+            # C4: Enforce parameters (top_p removed)
+            response = await self.model_client.chat(
+                agent_name="COO",
+                mission={"id": mission_id}, 
+                messages=messages,
+                model_name="default", 
+                temperature=0
+            )
+            
+            ai_output = response["content"]
+            summary_preview = ai_output[:50] + "..." if len(ai_output) > 50 else ai_output
+
+            # Log MODEL_RESPONSE
+            await self.store.log_timeline_event(mission_id, "MODEL_RESPONSE", {
+                "summary_preview": summary_preview,
+                "summary": ai_output  # Store full summary for CLI receipt
+            })
+            
+            # Log success
+            # We keep LLM_CALL for backward compatibility if needed, but spec says MODEL_RESPONSE is key.
+            # Let's stick to the spec: INIT -> MODEL_REQUEST -> MODEL_RESPONSE -> COMPLETE
+            
+            await self.store.update_mission_status(mission_id, "COMPLETED")
+            await self.store.log_timeline_event(mission_id, "COMPLETE", {"status": "SUCCESS"})
+            
+        except Exception as e:
+            await self.store.update_mission_status(mission_id, "FAILED")
+            await self.store.log_timeline_event(mission_id, "ERROR", {"error": str(e)})
+            # Re-raise to ensure CLI knows it failed if it's waiting
+            raise

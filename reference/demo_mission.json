@@ -1,0 +1,15 @@
+{
+    "mission_type": "DEMO_V1_1",
+    "tasks": [
+        {
+            "id": "demo_task_1",
+            "type": "llm_call",
+            "input_text": "The Agentic Compute Engine (ACE) is a distributed runtime environment designed to execute autonomous software agents in a secure, deterministic manner. Unlike traditional container orchestration systems, ACE enforces strict causality tracking through a cryptographic ledger known as the Mission Log. Every state transition, external API call, and resource modification is signed and sequenced, allowing for perfect replayability of any agent session. The system architecture separates the 'Planner' (LLM-based reasoning core) from the 'Executor' (sandboxed tool runner), ensuring that AI hallucinations cannot directly corrupt the host environment. ACE is built on a capability-based security model, where agents must explicitly request permissions for network access or filesystem writes, which are then granted or denied by a deterministic policy engine.",
+            "prompt": "Summarise the following description in 1–2 short paragraphs for a technical audience.",
+            "parameters": {
+                "temperature": 0,
+                "max_tokens": 256
+            }
+        }
+    ]
+}
